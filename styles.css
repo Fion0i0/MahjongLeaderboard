@@ -1,0 +1,196 @@
+:root {
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  color: #1b1f2a;
+  background: #f4f6fb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.container {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 24px;
+  display: grid;
+  gap: 16px;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0 0 8px;
+}
+
+p {
+  margin: 0;
+}
+
+.app-header {
+  display: grid;
+  gap: 6px;
+}
+
+.page-nav {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.page-tab {
+  border: 1px solid #c8cfdd;
+  border-radius: 999px;
+  padding: 8px 14px;
+  background: #f7f9fd;
+  cursor: pointer;
+}
+
+.page-tab.active {
+  background: #1f4dd7;
+  color: #fff;
+  border-color: #1f4dd7;
+}
+
+.card {
+  background: #fff;
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 6px 20px rgba(25, 35, 58, 0.08);
+}
+
+.page-panel {
+  display: none;
+}
+
+.page-panel.active {
+  display: block;
+}
+
+.grid.two {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  font-weight: 600;
+}
+
+input,
+button {
+  border: 1px solid #c8cfdd;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 14px;
+}
+
+button {
+  cursor: pointer;
+  background: #f7f9fd;
+}
+
+button:hover {
+  background: #eef3ff;
+}
+
+.actions {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+}
+
+.hint {
+  margin-top: 6px;
+  font-size: 13px;
+}
+
+#players-list {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.player-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr auto;
+  gap: 8px;
+}
+
+.remove-row {
+  width: 36px;
+}
+
+.muted {
+  color: #6f7a95;
+}
+
+.hidden {
+  display: none;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  border-bottom: 1px solid #e3e8f2;
+  text-align: left;
+  padding: 8px 6px;
+  vertical-align: top;
+}
+
+.review-list {
+  display: grid;
+  gap: 12px;
+}
+
+.review-year {
+  border: 1px solid #dce3f3;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.metrics-table {
+  margin-bottom: 10px;
+}
+
+.metrics-table td:first-child {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.badge {
+  border-radius: 999px;
+  padding: 5px 10px;
+  background: #eef3ff;
+  font-size: 12px;
+}
+
+@media (max-width: 640px) {
+  .player-row {
+    grid-template-columns: 1fr;
+  }
+
+  .remove-row {
+    width: 100%;
+  }
+}
