@@ -13,6 +13,7 @@ export const FAN_KEYWORDS: Record<string, number> = {
   邊張: 1,
   搶槓: 1,
   海底撈月: 1,
+  河底撈魚: 1,
   三暗刻: 2,
   門清自摸: 3,
   小三元: 4,
@@ -22,6 +23,9 @@ export const FAN_KEYWORDS: Record<string, number> = {
   小四喜: 8,
   大三元: 8,
   七搶一: 8,
+  地聽: 8,
+  天聽: 8,
+  Migi: 8,
   四暗刻: 10,
   字一色: 16,
   大四喜: 16,
@@ -66,14 +70,6 @@ export function parseFanFromText(text: string): { items: FanBreakdownItem[]; tot
     if (lianMatch) {
       const n = parseInt(lianMatch[1], 10);
       items.push({ label: `連${n}`, value: n * 2 });
-      continue;
-    }
-
-    // 花N pattern: 花1=1, 花2=2, etc.
-    const huaMatch = token.match(/^花(\d+)$/);
-    if (huaMatch) {
-      const n = parseInt(huaMatch[1], 10);
-      items.push({ label: `花${n}`, value: n });
       continue;
     }
 

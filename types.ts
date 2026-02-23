@@ -12,6 +12,7 @@ export interface Round {
   loserSeat?: number;
   fan: number;
   special: string;
+  dealerStreak?: number;
 }
 
 export interface Game {

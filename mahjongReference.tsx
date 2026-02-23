@@ -2,29 +2,33 @@
 import React, { useState } from 'react';
 
 export const SPECIAL_HAND_RANK: Record<string, number> = {
-  天胡: 24,
+  // 16台
+  天胡: 16,
   地胡: 16,
-  人胡: 16,
-  天聽: 16,
   大四喜: 16,
-  字一色: 16,
-  十六不搭: 16,
   八仙過海: 16,
-  四暗刻: 10,
-  清一色: 8,
-  小四喜: 8,
-  大三元: 8,
-  五暗刻: 8,
-  七搶一: 8,
+  十六不搭: 16,
+  // 8台
+  天聽: 8,
   地聽: 8,
+  七搶一: 8,
+  大三元: 8,
+  小四喜: 8,
+  字一色: 8,
+  五暗刻: 8,
   七對子: 8,
+  清一色: 8,
+  // 5台
+  四暗刻: 5,  
 };
 
 export const SPECIAL_HANDS_LIST = [
-  '天胡', '地胡', '人胡', '天聽',
-  '大四喜', '字一色', '十六不搭', '八仙過海',
-  '四暗刻', '清一色', '小四喜', '大三元',
-  '五暗刻', '七搶一', '地聽', '七對子',
+  // 16台
+  '天胡', '地胡', '大四喜', '八仙過海', '十六不搭',
+  // 8台
+  '天聽','地聽', '七搶一', '大三元', '小四喜', '字一色', '五暗刻', '七對子', '清一色',
+  // 5台
+  '四暗刻',  
 ];
 
 export const MAHJONG_REFERENCE = [
@@ -35,19 +39,18 @@ export const MAHJONG_REFERENCE = [
   { name: '八仙過海', fan: '16台', desc: '取得全部8張花牌' },
   { name: '十六不搭', fan: '16台', desc: '起手16張牌，無法組成任何順子、刻子、或搭子' },
   // 8台
+  { name: '天聽', fan: '8台', desc: '莊家打出第一張牌後，立即宣告聽牌' },
   { name: '地聽', fan: '8台', desc: '打出第一張牌後，立即宣告聽牌' },
   { name: '七搶一', fan: '8台', desc: '持有7張花牌，加上對手一張' },
   { name: '大三元', fan: '8台', desc: '持有中、發、白三組刻子(或槓子)' },
   { name: '小四喜', fan: '8台', desc: '持有東、南、西、北其中三組刻子及一對眼' },
-  { name: '字一色', fan: '8台', desc: '全由字牌組成' },  
-  { name: '五暗刻', fan: '8台', desc: '持有五組自己摸到的刻子' },  
+  { name: '字一色', fan: '8台', desc: '全由字牌組成' },
+  { name: '五暗刻', fan: '8台', desc: '持有五組自己摸到的刻子' },
   { name: '七對子', fan: '8台', desc: '由七個對子組成，又稱嚦咕嚦咕' },
   { name: '清一色', fan: '8台', desc: '全由萬、索、筒其中一種花色組成' },
-  
   // 5台
   { name: '四暗刻', fan: '5台', desc: '持有四組自己摸到的刻子' },
-  // 4台
-  { name: '天聽', fan: '4台', desc: '莊家打出第一張牌後，立即宣告聽牌' },
+  // 4台  
   { name: '小三元', fan: '4台', desc: '持有中、發、白其中兩組刻子及一對眼' },
   { name: '混一色', fan: '4台', desc: '全由字牌及萬、索、筒其中一種花色組成' },
   { name: '碰碰胡', fan: '4台', desc: '全由刻子(或槓子)組成' },
@@ -178,7 +181,7 @@ export function MahjongReferenceModal({ onClose }: { onClose: () => void }) {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between p-4 border-b border-[#2A2D33]">
-          <h2 className="text-lg font-bold text-[#E0E6ED]">台數列表</h2>
+          <h2 className="text-lg font-bold text-[#E0E6ED]">台數手冊</h2>
           <button
             onClick={onClose}
             className="text-[#707A8A] hover:text-[#E0E6ED] transition-colors p-1"

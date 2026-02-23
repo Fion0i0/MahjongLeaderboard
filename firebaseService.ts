@@ -1,6 +1,6 @@
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, onValue, set, push, remove } from "firebase/database";
-import { Game } from "./types";
+import { Game, Round } from "./types";
 
 const firebaseConfig = {
   apiKey: "AIzaSyAKtQM_ZMi29qZnC8GS6twOJdXaLsbr3nI",
@@ -62,6 +62,40 @@ export const updateGame = async (game: Game): Promise<void> => {
 export const deleteGame = async (gameId: string): Promise<void> => {
   const gameRef = ref(database, `games/${gameId}`);
   await remove(gameRef);
+};
+
+// Draft session (in-progress game)
+export interface DraftSession {
+  date: string;
+  note: string;
+  baseRate: number;
+  seats: string[];
+  rounds: Round[];
+}
+
+const draftRef = ref(database, 'draftSession');
+
+export const saveDraftSession = async (session: DraftSession): Promise<void> => {
+  await set(draftRef, session);
+};
+
+export const loadDraftSession = (callback: (session: DraftSession | null) => void) => {
+  return onValue(draftRef, (snapshot) => {
+    const data = snapshot.val();
+    if (data) {
+      callback({
+        ...data,
+        rounds: toArray(data.rounds),
+        seats: toArray(data.seats),
+      });
+    } else {
+      callback(null);
+    }
+  });
+};
+
+export const clearDraftSession = async (): Promise<void> => {
+  await remove(draftRef);
 };
 
 export { database };

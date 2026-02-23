@@ -1,6 +1,6 @@
-# Mahjong Leaderboard
+# HongKongers Mahjong Dragonboard (Beta)
 
-A lightweight app to record Mahjong games with friends and review yearly performance.
+A lightweight app to record Hong Kong-style Mahjong games with friends and review yearly performance.
 
 ## Tech Stack
 
@@ -11,20 +11,37 @@ A lightweight app to record Mahjong games with friends and review yearly perform
 
 ## Features
 
-- Three tabs via bottom navigation:
-  - **Record Game** - Manual entry or AI-powered natural language input
-  - **All Games** - View, edit, and delete game records
-  - **Yearly Review** - Auto-computed rankings & detailed player stats
-- Record games by date with as many players as needed.
-- Capture each player's game score and special hands (e.g. 大三元, 大四喜, 十三幺).
-- AI-powered game entry: describe a game in natural language (English/Cantonese/Mandarin).
-- AI-powered yearly analysis with player insights and fun facts.
-- Automatically compute yearly insights:
-  - 嬴最多錢 (Top 3)
-  - 出統最多次 (Top 3)
-  - 輸最多 (Top 3)
-  - 單次嬴最多台 (Top 3)
-- Real-time sync across devices via Firebase.
+### Record Game
+- 4-player seat assignment with VIP profile pictures
+- Round-by-round recording: winner, win type (出統/自摸), fan count, special hands, and 連莊 streak
+- Pop-up alert "邊個又出統" when selecting 出統
+- Configurable game settings: 良辰吉日 (date), 底 (base amount), 打幾大 (rate per fan)
+- Rate adjusts in units of 10 (e.g. 10, 20, 30, 40)
+- 台數手冊 — reference modal for all hand types and fan values
+- 台數助手 — AI-assisted fan calculator from natural language input
+- Special hand picker with add/remove counters, ordered by fan value (16台 → 5台)
+- Draft auto-save to Firebase — resume in-progress games after closing the browser
+
+### All Games
+- View all completed games sorted by date
+- Resume/edit saved games by clicking the edit icon
+- Delete games
+
+### Yearly Review
+- Year selector to switch between years (defaults to newest)
+- Auto-computed rankings with trophy/medal/award icons:
+  - 嬴哂啲錢 (most money won)
+  - 出統王 (most times dealing in)
+  - 輸哂啲錢 (most money lost)
+  - 至尊雀聖 (highest single special hand)
+  - 連莊王 (longest consecutive dealer streak)
+  - 全勤者 (highest attendance rate)
+- Detailed player stats table: games played, total score, wins, losses, specials
+- AI-powered yearly analysis with player insights and fun facts
+
+### General
+- Mobile-responsive design with compact layouts for phone screens
+- Real-time sync across devices via Firebase
 
 ## Setup
 
