@@ -1,82 +1,32 @@
-<!doctype html>
+
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Mahjong Leaderboard</title>
-    <link rel="stylesheet" href="styles.css" />
-  </head>
-  <body>
-    <main class="container">
-      <header class="app-header">
-        <h1>Mahjong Results Tracker</h1>
-        <p>Track each game, review full history, and check yearly winners/losers/special-hand masters.</p>
-      </header>
-
-      <nav class="page-nav" aria-label="Main sections">
-        <button type="button" class="page-tab active" data-page-target="record-page">Record Game</button>
-        <button type="button" class="page-tab" data-page-target="games-page">All Games</button>
-        <button type="button" class="page-tab" data-page-target="review-page">Yearly Review</button>
-      </nav>
-
-      <section id="record-page" class="card page-panel active" data-page="record-page">
-        <h2>Record Game</h2>
-        <form id="game-form">
-          <div class="grid two">
-            <label>
-              Game date
-              <input type="date" id="game-date" required />
-            </label>
-            <label>
-              Table notes (optional)
-              <input type="text" id="game-note" placeholder="Weekend match" />
-            </label>
-          </div>
-
-          <h3>Players</h3>
-          <div id="players-list"></div>
-          <p class="muted hint">Special hand examples: 大三元, 大四喜, 十三幺. Use comma to separate multiple items.</p>
-          <div class="actions">
-            <button type="button" id="add-player">+ Add Player Row</button>
-            <button type="submit">Save Game</button>
-          </div>
-        </form>
-      </section>
-
-      <section id="games-page" class="card page-panel" data-page="games-page">
-        <h2>All Games</h2>
-        <div id="games-empty" class="muted">No games yet. Add your first game in Record Game.</div>
-        <div id="games-table-wrap" class="table-wrap hidden">
-          <table id="games-table">
-            <thead>
-              <tr>
-                <th>Date</th>
-                <th>Players</th>
-                <th>Special hands</th>
-                <th>Notes</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </section>
-
-      <section id="review-page" class="card page-panel" data-page="review-page">
-        <h2>Yearly Review</h2>
-        <div id="yearly-review" class="review-list"></div>
-      </section>
-    </main>
-
-    <template id="player-row-template">
-      <div class="player-row">
-        <input type="text" class="player-name" placeholder="Player name" required />
-        <input type="number" class="player-score" placeholder="Score" required />
-        <input type="text" class="player-special" placeholder="Special hands (e.g. 大三元, 十三幺)" />
-        <button type="button" class="remove-row" title="Remove row">✕</button>
-      </div>
-    </template>
-
-    <script src="script.js"></script>
-  </body>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mahjong Leaderboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: #0B0E14;
+    }
+  </style>
+<script type="importmap">
+{
+  "imports": {
+    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
+    "@google/genai": "https://esm.sh/@google/genai@^1.36.0",
+    "react/": "https://esm.sh/react@^19.2.3/",
+    "react": "https://esm.sh/react@^19.2.3"
+  }
+}
+</script>
+</head>
+<body>
+  <div id="root"></div>
+<script type="module" src="/index.tsx"></script>
+</body>
 </html>
