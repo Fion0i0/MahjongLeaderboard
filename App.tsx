@@ -148,7 +148,16 @@ function computeYearlyData(games: Game[]): YearlyData[] {
       });
 
       if (player.score === highestScore) stats.wins += 1;
-      if (player.score === lowestScore) stats.losses += 1;
+    }
+
+    // Count actual 出統 from round data (loserSeat in chutong rounds)
+    for (const round of (game.rounds || [])) {
+      if (round.winType === 'chutong' && round.loserSeat !== undefined) {
+        const loserName = game.seats[round.loserSeat];
+        if (loserName && playerStats.has(loserName)) {
+          playerStats.get(loserName)!.losses += 1;
+        }
+      }
     }
   }
 
@@ -1222,7 +1231,7 @@ export default function App() {
           const mostLossesTop3 = pickTopPlayers(stats, {
             getValue: (s) => s.losses,
             requirePositive: true,
-            formatValue: (v) => String(v),
+            formatValue: (v) => `${v}次`,
           });
           const mostMoneyLoseTop3 = pickBottomPlayers(stats, {
             getValue: (s) => s.totalScore,
