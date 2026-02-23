@@ -1,10 +1,11 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
 import { Game, Player, Round, PlayerYearlyStats, YearlyData, GeminiAnalysisResult } from './types';
-import { subscribeToGames, addGame, deleteGame as deleteGameFromDB, saveDraftSession, loadDraftSession, clearDraftSession, DraftSession } from './firebaseService';
+import { subscribeToGames, addGame, deleteGame as deleteGameFromDB, saveDraftSession, loadDraftSession, clearDraftSession, DraftSession, signInAnonymousUser } from './firebaseService';
 import { parseGameWithAI, analyzePerformanceWithAI } from './geminiService';
 import { VIPMember, loadVIPList } from './VIP/vipList';
 import { parseFanFromText } from './fanCalculator';
+import iconImg from './icon.png';
 import {
   parseSpecialHands,
   getSpecialHandRank,
@@ -274,6 +275,11 @@ function TableInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
 // ─── Main App ───────────────────────────────────────────────────────────────────
 
 export default function App() {
+  // Home page
+  const [showHome, setShowHome] = useState(true);
+  const [pin, setPin] = useState('');
+  const [pinError, setPinError] = useState(false);
+
   // Data state
   const [games, setGames] = useState<Game[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -330,15 +336,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (showHome) return;
     const unsubscribe = subscribeToGames((firebaseGames) => {
       setGames(firebaseGames);
       setIsLoading(false);
     });
     return () => unsubscribe();
-  }, []);
+  }, [showHome]);
 
-  // Load draft session on startup
+  // Load draft session after PIN accepted
   useEffect(() => {
+    if (showHome) return;
     const unsubscribe = loadDraftSession((draft) => {
       if (draft && draft.seats.length === 4) {
         setGameSession(draft);
@@ -347,7 +355,7 @@ export default function App() {
     });
     return () => unsubscribe();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [showHome]);
 
   // Auto-save game session to Firebase on every change
   useEffect(() => {
@@ -571,6 +579,85 @@ export default function App() {
     }
     setIsAiAnalyzing(null);
   };
+
+  // ─── Home Page ──────────────────────────────────────────────────────────────
+
+  const handlePinDigit = (digit: string) => {
+    setPinError(false);
+    const next = pin + digit;
+    if (next.length <= 4) {
+      setPin(next);
+      if (next.length === 4) {
+        if (next === '7749') {
+          signInAnonymousUser().then(() => {
+            setShowHome(false);
+          }).catch(() => {
+            alert('Authentication failed. Please try again.');
+            setPin('');
+          });
+        } else {
+          setPinError(true);
+          setTimeout(() => { setPin(''); setPinError(false); }, 600);
+        }
+      }
+    }
+  };
+
+  const handlePinDelete = () => {
+    setPinError(false);
+    setPin((prev) => prev.slice(0, -1));
+  };
+
+  if (showHome) {
+    return (
+      <div className="min-h-screen bg-[#0B0E14] flex flex-col items-center justify-center select-none px-4">
+        <img
+          src={iconImg}
+          alt="App Icon"
+          className="w-32 h-32 rounded-3xl shadow-2xl mb-4"
+        />
+        <h1 className="text-2xl font-bold text-[#E0E6ED] tracking-wide mb-8">
+          漢奸撚麻雀醫館App
+        </h1>
+
+        {/* PIN dots */}
+        <div className="flex gap-4 mb-6">
+          {[0, 1, 2, 3].map((i) => (
+            <div
+              key={i}
+              className={`w-4 h-4 rounded-full transition-all duration-200 ${
+                pinError
+                  ? 'bg-[#FF3131]'
+                  : i < pin.length
+                    ? 'bg-[#3df2bc]'
+                    : 'bg-[#2A2D33] border border-[#707A8A]'
+              } ${pinError ? 'animate-shake' : ''}`}
+            />
+          ))}
+        </div>
+
+        <p className={`text-sm mb-6 ${pinError ? 'text-[#FF3131]' : 'text-[#707A8A]'}`}>
+          {pinError ? '密碼錯誤' : '請輸入密碼'}
+        </p>
+
+        {/* Number pad */}
+        <div className="grid grid-cols-3 gap-3 max-w-[240px]">
+          {['1','2','3','4','5','6','7','8','9','','0','⌫'].map((key) => {
+            if (key === '') return <div key="empty" />;
+            return (
+              <button
+                key={key}
+                onClick={() => key === '⌫' ? handlePinDelete() : handlePinDigit(key)}
+                className="w-16 h-16 rounded-full bg-[#1A1D23] border border-[#2A2D33] text-[#E0E6ED] text-xl font-medium flex items-center justify-center hover:bg-[#2A2D33] active:scale-95 transition-all"
+              >
+                {key}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
 
   // ─── Loading State ──────────────────────────────────────────────────────────
 

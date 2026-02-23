@@ -1,5 +1,6 @@
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, onValue, set, push, remove } from "firebase/database";
+import { getAuth, signInAnonymously } from "firebase/auth";
 import { Game, Round } from "./types";
 
 const firebaseConfig = {
@@ -15,6 +16,11 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const database = getDatabase(app);
+const auth = getAuth(app);
+
+export const signInAnonymousUser = async (): Promise<void> => {
+  await signInAnonymously(auth);
+};
 
 const gamesRef = ref(database, 'games');
 
