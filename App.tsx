@@ -1,0 +1,1353 @@
+
+import React, { useState, useEffect, useMemo } from 'react';
+import { Game, Player, Round, PlayerYearlyStats, YearlyData, GeminiAnalysisResult } from './types';
+import { subscribeToGames, addGame, deleteGame as deleteGameFromDB } from './firebaseService';
+import { parseGameWithAI, analyzePerformanceWithAI } from './geminiService';
+import { VIPMember, loadVIPList } from './VIP/vipList';
+import { parseFanFromText } from './fanCalculator';
+import {
+  parseSpecialHands,
+  getSpecialHandRank,
+  formatSpecialBreakdown,
+  SpecialHandPicker,
+  MahjongReferenceModal,
+} from './mahjongReference';
+
+// ─── Constants ──────────────────────────────────────────────────────────────────
+
+const SEAT_LABELS = ['東', '南', '西', '北'];
+
+// Cross layout: 3x3 grid mapping cell index → seat index
+// Top=東(0), Right=南(1), Bottom=西(2), Left=北(3)
+const CROSS_GRID: (number | null)[] = [null, 0, null, 3, null, 1, null, 2, null];
+
+// ─── Helper Functions ───────────────────────────────────────────────────────────
+
+
+function pickTopPlayers(
+  statsArray: PlayerYearlyStats[],
+  options: {
+    getValue: (s: PlayerYearlyStats) => number;
+    requirePositive?: boolean;
+    formatValue?: (v: number) => string;
+  }
+): string[] {
+  const { getValue, requirePositive = true, formatValue = (v) => String(v) } = options;
+
+  const ranked = statsArray
+    .map((stats) => ({ name: stats.name, value: getValue(stats) }))
+    .sort((a, b) => b.value - a.value || a.name.localeCompare(b.name));
+
+  if (ranked.length === 0) return [];
+  if (requirePositive && ranked[0].value <= 0) return [];
+
+  return ranked.slice(0, 3).map((item) => `${item.name} (${formatValue(item.value)})`);
+}
+
+function pickBottomPlayers(
+  statsArray: PlayerYearlyStats[],
+  options: {
+    getValue: (s: PlayerYearlyStats) => number;
+    requireNegative?: boolean;
+    formatValue?: (v: number) => string;
+  }
+): string[] {
+  const { getValue, requireNegative = true, formatValue = (v) => String(v) } = options;
+
+  const ranked = statsArray
+    .map((stats) => ({ name: stats.name, value: getValue(stats) }))
+    .sort((a, b) => a.value - b.value || a.name.localeCompare(b.name));
+
+  if (ranked.length === 0) return [];
+  if (requireNegative && ranked[0].value >= 0) return [];
+
+  return ranked.slice(0, 3).map((item) => `${item.name} (${formatValue(item.value)})`);
+}
+
+function pickTopSpecialHands(statsArray: PlayerYearlyStats[]): string[] {
+  const ranked = statsArray
+    .map((stats) => ({
+      name: stats.name,
+      hand: stats.maxSingleHand?.name || '',
+      rank: stats.maxSingleHand?.rank || 0,
+    }))
+    .filter((item) => item.hand && item.rank > 0)
+    .sort((a, b) => b.rank - a.rank || a.name.localeCompare(b.name));
+
+  if (ranked.length === 0) return [];
+  return ranked.slice(0, 3).map((item) => `${item.name} (${item.hand})`);
+}
+
+function computeYearlyData(games: Game[]): YearlyData[] {
+  if (games.length === 0) return [];
+
+  const byYear = new Map<number, Map<string, PlayerYearlyStats>>();
+
+  for (const game of games) {
+    const year = new Date(game.date).getFullYear();
+    if (!byYear.has(year)) byYear.set(year, new Map());
+    const playerStats = byYear.get(year)!;
+
+    let highestScore = Number.NEGATIVE_INFINITY;
+    let lowestScore = Number.POSITIVE_INFINITY;
+
+    game.players.forEach((player) => {
+      if (player.score > highestScore) highestScore = player.score;
+      if (player.score < lowestScore) lowestScore = player.score;
+    });
+
+    for (const player of game.players) {
+      if (!playerStats.has(player.name)) {
+        playerStats.set(player.name, {
+          name: player.name,
+          totalScore: 0,
+          gamesPlayed: 0,
+          wins: 0,
+          losses: 0,
+          specialCount: 0,
+          specialBreakdown: {},
+          maxSingleHand: { name: '', rank: 0 },
+        });
+      }
+
+      const stats = playerStats.get(player.name)!;
+      const specialHands = parseSpecialHands(player.special);
+
+      stats.totalScore += player.score;
+      stats.gamesPlayed += 1;
+      stats.specialCount += specialHands.length;
+
+      specialHands.forEach((handName) => {
+        const currentCount = stats.specialBreakdown[handName] || 0;
+        stats.specialBreakdown[handName] = currentCount + 1;
+
+        const handRank = getSpecialHandRank(handName);
+        if (handRank > stats.maxSingleHand.rank) {
+          stats.maxSingleHand = { name: handName, rank: handRank };
+        }
+      });
+
+      if (player.score === highestScore) stats.wins += 1;
+      if (player.score === lowestScore) stats.losses += 1;
+    }
+  }
+
+  const years = [...byYear.keys()].sort((a, b) => b - a);
+
+  return years.map((year) => {
+    const statsMap = byYear.get(year)!;
+    const stats = [...statsMap.values()];
+    return { year, stats };
+  });
+}
+
+function computeScoresFromRounds(seats: string[], rounds: Round[], baseRate: number): Player[] {
+  const scores = [0, 0, 0, 0];
+  const specials: string[][] = [[], [], [], []];
+
+  for (const round of rounds) {
+    const amount = round.fan * baseRate;
+    if (round.winType === 'zimo') {
+      scores[round.winnerSeat] += amount * 3;
+      for (let i = 0; i < 4; i++) {
+        if (i !== round.winnerSeat) scores[i] -= amount;
+      }
+    } else if (round.loserSeat !== undefined) {
+      scores[round.winnerSeat] += amount;
+      scores[round.loserSeat] -= amount;
+    }
+    if (round.special) {
+      specials[round.winnerSeat].push(round.special);
+    }
+  }
+
+  return seats.map((name, i) => ({
+    name,
+    score: scores[i],
+    special: specials[i].join(', '),
+  }));
+}
+
+// ─── Inline Components ──────────────────────────────────────────────────────────
+
+function Card({ children, className = '', onClick }: {
+  children: React.ReactNode;
+  className?: string;
+  onClick?: () => void;
+  key?: React.Key;
+}) {
+  return (
+    <div
+      className={`bg-[#1A1D23] rounded-xl shadow-lg border border-[#2A2D33] p-4 ${className}`}
+      onClick={onClick}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Button({ children, onClick, variant = 'primary', className = '', disabled = false, type = 'button' }: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  variant?: 'primary' | 'secondary' | 'danger' | 'ghost';
+  className?: string;
+  disabled?: boolean;
+  type?: 'button' | 'submit';
+}) {
+  const base = 'px-4 py-2 rounded-xl font-medium transition-all duration-200 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed';
+  const variants: Record<string, string> = {
+    primary: 'bg-[#3df2bc] text-[#0B0E14] hover:bg-[#2fd8a5]',
+    secondary: 'bg-[#2A2D33] text-[#E0E6ED] hover:bg-[#353840]',
+    danger: 'bg-[#FF3131] text-white hover:bg-[#e02020]',
+    ghost: 'bg-transparent text-[#707A8A] hover:text-[#E0E6ED] hover:bg-[#1A1D23]',
+  };
+
+  return (
+    <button
+      type={type}
+      onClick={onClick}
+      disabled={disabled}
+      className={`${base} ${variants[variant]} ${className}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function NavButton({ active, onClick, icon, label }: {
+  active: boolean;
+  onClick: () => void;
+  icon: string;
+  label: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex flex-col items-center gap-1 px-4 py-1 transition-all duration-200 ${
+        active ? 'text-[#3df2bc]' : 'text-[#707A8A] hover:text-[#E0E6ED]'
+      }`}
+    >
+      <i className={`fas ${icon} text-lg`} />
+      <span className="text-xs font-medium">{label}</span>
+    </button>
+  );
+}
+
+function TableInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
+  return (
+    <input
+      {...props}
+      className={`w-full bg-[#0B0E14] border border-[#2A2D33] rounded-lg px-3 py-2 text-[#E0E6ED] placeholder-[#707A8A] focus:outline-none focus:border-[#3df2bc] transition-all ${props.className || ''}`}
+    />
+  );
+}
+
+// ─── Main App ───────────────────────────────────────────────────────────────────
+
+export default function App() {
+  // Data state
+  const [games, setGames] = useState<Game[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+
+  // Navigation
+  const [activeTab, setActiveTab] = useState<'record' | 'games' | 'review'>('record');
+
+  // VIP list
+  const [vipList, setVipList] = useState<VIPMember[]>([]);
+
+  // Game Setup (before session starts)
+  const [gameDate, setGameDate] = useState(new Date().toISOString().split('T')[0]);
+  const [gameNote, setGameNote] = useState('');
+  const [baseRate, setBaseRate] = useState(1);
+  const [seatAssignments, setSeatAssignments] = useState<(string | null)[]>([null, null, null, null]);
+  const [selectingSeat, setSelectingSeat] = useState<number | null>(null);
+  const [customName, setCustomName] = useState('');
+
+  // Active Game Session
+  const [gameSession, setGameSession] = useState<{
+    date: string;
+    note: string;
+    baseRate: number;
+    seats: string[];
+    rounds: Round[];
+  } | null>(null);
+
+  // Round form
+  const [roundWinner, setRoundWinner] = useState<number | null>(null);
+  const [roundWinType, setRoundWinType] = useState<'zimo' | 'chutong'>('chutong');
+  const [roundLoser, setRoundLoser] = useState<number | null>(null);
+  const [roundFan, setRoundFan] = useState(3);
+  const [roundSpecial, setRoundSpecial] = useState('');
+  const [fanCalcText, setFanCalcText] = useState('');
+
+  // AI mode
+  const [aiMode, setAiMode] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState('');
+  const [isAiParsing, setIsAiParsing] = useState(false);
+
+  // AI analysis
+  const [aiAnalysis, setAiAnalysis] = useState<Record<number, GeminiAnalysisResult | null>>({});
+  const [isAiAnalyzing, setIsAiAnalyzing] = useState<number | null>(null);
+
+  // Mahjong reference modal
+  const [showMahjong, setShowMahjong] = useState(false);
+
+  // ─── Initialization ──────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    setVipList(loadVIPList());
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = subscribeToGames((firebaseGames) => {
+      setGames(firebaseGames);
+      setIsLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // ─── Computed Data ──────────────────────────────────────────────────────────
+
+  const yearlyData = useMemo(() => computeYearlyData(games), [games]);
+
+  const knownPlayerNames = useMemo(() => {
+    const names = new Set<string>();
+    games.forEach((g) => g.players.forEach((p) => names.add(p.name)));
+    return Array.from(names);
+  }, [games]);
+
+  // ─── Seat Assignment Handlers ─────────────────────────────────────────────
+
+  const assignSeat = (seatIndex: number, name: string) => {
+    setSeatAssignments((prev) => {
+      const next = [...prev];
+      next[seatIndex] = name;
+      return next;
+    });
+    setSelectingSeat(null);
+    setCustomName('');
+  };
+
+  const clearSeat = (seatIndex: number) => {
+    setSeatAssignments((prev) => {
+      const next = [...prev];
+      next[seatIndex] = null;
+      return next;
+    });
+  };
+
+  // ─── Game Session Handlers ────────────────────────────────────────────────
+
+  const startGameSession = () => {
+    const filledSeats = seatAssignments.filter(Boolean);
+    if (filledSeats.length < 4) {
+      alert('Please assign all 4 seats.');
+      return;
+    }
+    const unique = new Set(filledSeats.map((n) => n!.toLowerCase()));
+    if (unique.size < 4) {
+      alert('Each seat must have a different player.');
+      return;
+    }
+
+    setGameSession({
+      date: gameDate,
+      note: gameNote,
+      baseRate,
+      seats: seatAssignments as string[],
+      rounds: [],
+    });
+  };
+
+  const addRound = () => {
+    if (roundWinner === null) {
+      alert('Please select a winner.');
+      return;
+    }
+    if (roundWinType === 'chutong' && roundLoser === null) {
+      alert('Please select who discarded (出統者).');
+      return;
+    }
+    if (roundFan <= 0) {
+      alert('台數 must be greater than 0.');
+      return;
+    }
+
+    const newRound: Round = {
+      id: crypto.randomUUID(),
+      winnerSeat: roundWinner,
+      winType: roundWinType,
+      ...(roundWinType === 'chutong' ? { loserSeat: roundLoser! } : {}),
+      fan: roundFan,
+      special: roundSpecial,
+    };
+
+    setGameSession((prev) =>
+      prev ? { ...prev, rounds: [...prev.rounds, newRound] } : prev
+    );
+
+    // Reset round form
+    setRoundWinner(null);
+    setRoundWinType('chutong');
+    setRoundLoser(null);
+    setRoundFan(3);
+    setRoundSpecial('');
+    setFanCalcText('');
+  };
+
+  const deleteRound = (roundId: string) => {
+    setGameSession((prev) =>
+      prev ? { ...prev, rounds: prev.rounds.filter((r) => r.id !== roundId) } : prev
+    );
+  };
+
+  const endGameAndSave = async () => {
+    if (!gameSession) return;
+
+    const players = computeScoresFromRounds(
+      gameSession.seats,
+      gameSession.rounds,
+      gameSession.baseRate
+    );
+
+    // Strip undefined values from rounds (Firebase rejects undefined)
+    const cleanRounds = gameSession.rounds.map((r) =>
+      JSON.parse(JSON.stringify(r))
+    );
+
+    const game: Game = {
+      id: crypto.randomUUID(),
+      date: gameSession.date,
+      note: gameSession.note,
+      baseRate: gameSession.baseRate,
+      seats: gameSession.seats,
+      rounds: cleanRounds,
+      players,
+    };
+
+    try {
+      await addGame(game);
+
+      // Reset everything
+      setGameSession(null);
+      setGameDate(new Date().toISOString().split('T')[0]);
+      setGameNote('');
+      setBaseRate(1);
+      setSeatAssignments([null, null, null, null]);
+      setActiveTab('games');
+    } catch (err) {
+      console.error('Failed to save game:', err);
+      alert('Failed to save game. Please try again.');
+    }
+  };
+
+  const cancelGameSession = () => {
+    if (gameSession && gameSession.rounds.length > 0) {
+      if (!confirm('Discard this game session? All rounds will be lost.')) return;
+    }
+    setGameSession(null);
+  };
+
+  // ─── Other Handlers ───────────────────────────────────────────────────────
+
+  const handleDeleteGame = async (gameId: string) => {
+    if (!confirm('Delete this game?')) return;
+    await deleteGameFromDB(gameId);
+  };
+
+  const handleAiParse = async () => {
+    if (!aiPrompt.trim()) return;
+    setIsAiParsing(true);
+    try {
+      const result = await parseGameWithAI(aiPrompt, knownPlayerNames);
+      if (result) {
+        const players = result.players.map((p) => ({
+          name: p.name,
+          score: p.score,
+          special: p.special || '',
+        }));
+        const game: Game = {
+          id: crypto.randomUUID(),
+          date: result.date || new Date().toISOString().split('T')[0],
+          note: result.note || '',
+          baseRate: 0,
+          seats: players.map((p) => p.name),
+          rounds: [],
+          players,
+        };
+        await addGame(game);
+        setAiMode(false);
+        setAiPrompt('');
+        setActiveTab('games');
+      } else {
+        alert('Could not parse the input. Please try again with more detail.');
+      }
+    } catch {
+      alert('AI parsing failed. Please try manual entry.');
+    }
+    setIsAiParsing(false);
+  };
+
+  const handleAiAnalyze = async (year: number) => {
+    setIsAiAnalyzing(year);
+    try {
+      const yearGames = games.filter((g) => new Date(g.date).getFullYear() === year);
+      const result = await analyzePerformanceWithAI(JSON.stringify(yearGames), year);
+      setAiAnalysis((prev) => ({ ...prev, [year]: result }));
+    } catch {
+      alert('AI analysis failed. Please try again.');
+    }
+    setIsAiAnalyzing(null);
+  };
+
+  // ─── Loading State ──────────────────────────────────────────────────────────
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-[#0B0E14] flex items-center justify-center">
+        <div className="text-[#3df2bc] text-xl font-bold animate-pulse">
+          <i className="fas fa-mahjong mr-2" />
+          Loading...
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Record Game Tab ────────────────────────────────────────────────────────
+
+  const renderRecordTab = () => {
+    // ── Active game session: round recording ──
+    if (gameSession) {
+      const scores = computeScoresFromRounds(
+        gameSession.seats,
+        gameSession.rounds,
+        gameSession.baseRate
+      );
+
+      return (
+        <div className="space-y-4">
+          {/* Game header with player scores */}
+          <Card>
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <span className="text-sm text-[#3df2bc] font-semibold">{gameSession.date}</span>
+                <span className="text-xs text-[#707A8A] ml-2">${gameSession.baseRate}/台</span>
+                {gameSession.note && (
+                  <span className="text-xs text-[#707A8A] ml-2">({gameSession.note})</span>
+                )}
+              </div>
+              <Button variant="ghost" onClick={cancelGameSession} className="text-xs px-2 py-1">
+                <i className="fas fa-xmark mr-1" />Cancel
+              </Button>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 max-w-xs mx-auto place-items-center">
+              {CROSS_GRID.map((seatIdx, cellIdx) => {
+                if (seatIdx === null) {
+                  return <div key={cellIdx} />;
+                }
+                const name = gameSession.seats[seatIdx];
+                const vip = vipList.find((v) => v.name === name);
+                const score = scores[seatIdx]?.score || 0;
+                return (
+                  <div key={cellIdx} className="flex flex-col items-center text-center">
+                    {vip?.image ? (
+                      <img
+                        src={vip.image}
+                        alt={name}
+                        className="w-10 h-10 rounded-full object-cover mb-1"
+                      />
+                    ) : (
+                      <div className="w-10 h-10 rounded-full bg-[#2A2D33] flex items-center justify-center mb-1 text-sm font-bold text-[#707A8A]">
+                        {name[0]}
+                      </div>
+                    )}
+                    <span className="text-xs text-[#FFD700]">{SEAT_LABELS[seatIdx]}</span>
+                    <span className="text-xs font-medium text-[#E0E6ED] truncate w-full">
+                      {name}
+                    </span>
+                    <span
+                      className={`text-sm font-bold ${
+                        score > 0
+                          ? 'text-[#3df2bc]'
+                          : score < 0
+                            ? 'text-[#FF3131]'
+                            : 'text-[#707A8A]'
+                      }`}
+                    >
+                      {score > 0 ? '+' : ''}
+                      {score}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+
+          {/* Add round form */}
+          <Card>
+            <h3 className="text-sm font-semibold text-[#E0E6ED] mb-3">Add Round</h3>
+
+            {/* Winner selection */}
+            <div className="mb-3">
+              <label className="block text-xs text-[#707A8A] mb-1">Winner (胡牌者)</label>
+              <div className="grid grid-cols-4 gap-2">
+                {gameSession.seats.map((name, i) => (
+                  <button
+                    key={i}
+                    type="button"
+                    onClick={() => {
+                      setRoundWinner(i);
+                      if (roundLoser === i) setRoundLoser(null);
+                    }}
+                    className={`px-2 py-2 rounded-lg text-xs font-medium text-center transition-all ${
+                      roundWinner === i
+                        ? 'bg-[#3df2bc] text-[#0B0E14]'
+                        : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] hover:border-[#3df2bc]'
+                    }`}
+                  >
+                    {name}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Win type */}
+            <div className="mb-3">
+              <label className="block text-xs text-[#707A8A] mb-1">Win Type</label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRoundWinType('chutong');
+                    setRoundLoser(null);
+                  }}
+                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${
+                    roundWinType === 'chutong'
+                      ? 'bg-[#FF3131] text-white'
+                      : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
+                  }`}
+                >
+                  出統
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRoundWinType('zimo');
+                    setRoundLoser(null);
+                  }}
+                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${
+                    roundWinType === 'zimo'
+                      ? 'bg-[#FFD700] text-[#0B0E14]'
+                      : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
+                  }`}
+                >
+                  自摸
+                </button>
+              </div>
+            </div>
+
+            {/* Loser (if chutong) */}
+            {roundWinType === 'chutong' && (
+              <div className="mb-3">
+                <label className="block text-xs text-[#707A8A] mb-1">Discarder (出統者)</label>
+                <div className="grid grid-cols-3 gap-2">
+                  {gameSession.seats.map((name, i) => {
+                    if (i === roundWinner) return null;
+                    return (
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => setRoundLoser(i)}
+                        className={`px-2 py-2 rounded-lg text-xs font-medium text-center transition-all ${
+                          roundLoser === i
+                            ? 'bg-[#FF3131] text-white'
+                            : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] hover:border-[#FF3131]'
+                        }`}
+                      >
+                        {name}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Fan + Special */}
+            <div className="grid grid-cols-2 gap-3 mb-3">
+              <div>
+                <label className="block text-xs text-[#707A8A] mb-1">台數</label>
+                <TableInput
+                  type="number"
+                  min={1}
+                  value={roundFan}
+                  onChange={(e) => setRoundFan(Number(e.target.value))}
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-[#707A8A] mb-1">Special</label>
+                <SpecialHandPicker value={roundSpecial} onChange={setRoundSpecial} />
+              </div>
+            </div>
+
+            {/* Fan Calculator */}
+            <div className="mb-3">
+              <label className="block text-xs text-[#707A8A] mb-1">
+                台數助手 <span className="text-[#3df2bc]">— 輸入條件自動計算</span>
+              </label>
+              <input
+                type="text"
+                value={fanCalcText}
+                onChange={(e) => {
+                  const text = e.target.value;
+                  setFanCalcText(text);
+                  if (text.trim()) {
+                    const result = parseFanFromText(text);
+                    if (result.total > 0) setRoundFan(result.total);
+                  }
+                }}
+                placeholder="例: 莊家、連2、正花、碰中"
+                className="w-full bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#3df2bc] placeholder-[#707A8A]"
+              />
+              {fanCalcText.trim() && (() => {
+                const result = parseFanFromText(fanCalcText);
+                if (result.items.length === 0) return null;
+                return (
+                  <div className="mt-1.5 bg-[#0B0E14] rounded-lg px-3 py-2 border border-[#2A2D33]">
+                    <div className="text-xs text-[#707A8A]">
+                      {result.items.map((item, idx) => (
+                        <span key={idx}>
+                          {idx > 0 && <span className="text-[#2A2D33] mx-1">+</span>}
+                          <span className="text-[#E0E6ED]">{item.label}</span>
+                          <span className="text-[#707A8A]">({item.value})</span>
+                        </span>
+                      ))}
+                      <span className="text-[#2A2D33] mx-1">=</span>
+                      <span className="text-[#3df2bc] font-bold">{result.total}台</span>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+
+            <Button onClick={addRound} className="w-full">
+              <i className="fas fa-plus mr-2" />
+              Add Round
+            </Button>
+          </Card>
+
+          {/* Round history */}
+          {gameSession.rounds.length > 0 && (
+            <Card>
+              <h3 className="text-sm font-semibold text-[#E0E6ED] mb-3">
+                Rounds ({gameSession.rounds.length})
+              </h3>
+              <div className="space-y-2">
+                {gameSession.rounds.map((round, idx) => (
+                  <div
+                    key={round.id}
+                    className="flex items-center justify-between bg-[#0B0E14] rounded-lg px-3 py-2"
+                  >
+                    <div className="flex-1 text-sm">
+                      <span className="text-[#707A8A]">#{idx + 1}</span>
+                      <span className="text-[#3df2bc] font-medium ml-2">
+                        {gameSession.seats[round.winnerSeat]}
+                      </span>
+                      <span
+                        className={`ml-1 text-xs px-1.5 py-0.5 rounded ${
+                          round.winType === 'zimo'
+                            ? 'bg-[#FFD700]/20 text-[#FFD700]'
+                            : 'bg-[#FF3131]/20 text-[#FF3131]'
+                        }`}
+                      >
+                        {round.winType === 'zimo' ? '自摸' : '出統'}
+                      </span>
+                      {round.winType === 'chutong' && round.loserSeat !== undefined && (
+                        <span className="text-[#FF3131] text-xs ml-1">
+                          ← {gameSession.seats[round.loserSeat]}
+                        </span>
+                      )}
+                      <span className="text-[#E0E6ED] ml-2">{round.fan}台</span>
+                      {round.special && (
+                        <span className="text-[#FFD700] text-xs ml-2">{round.special}</span>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => deleteRound(round.id)}
+                      className="text-[#707A8A] hover:text-[#FF3131] transition-colors px-2"
+                    >
+                      <i className="fas fa-xmark text-xs" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
+
+          {/* End game */}
+          <Button
+            onClick={endGameAndSave}
+            className="w-full"
+            disabled={gameSession.rounds.length === 0}
+          >
+            <i className="fas fa-flag-checkered mr-2" />
+            End Game & Save
+          </Button>
+        </div>
+      );
+    }
+
+    // ── Game setup (no active session) ──
+    return (
+      <div className="space-y-4">
+        <Card>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-bold text-[#E0E6ED]">New Game</h2>
+            <Button
+              variant={aiMode ? 'primary' : 'secondary'}
+              onClick={() => setAiMode(!aiMode)}
+              className="text-sm px-3 py-1"
+            >
+              <i className={`fas ${aiMode ? 'fa-keyboard' : 'fa-wand-magic-sparkles'} mr-1`} />
+              {aiMode ? 'Manual' : 'AI'}
+            </Button>
+          </div>
+
+          {aiMode ? (
+            <div className="space-y-3">
+              <textarea
+                value={aiPrompt}
+                onChange={(e) => setAiPrompt(e.target.value)}
+                placeholder={
+                  "e.g. 1月15日 Alan 500, Bob -200, Charlie 300, David -600, Alan打咗大三元\n\nor: Jan 15 game, Alan won 500, Bob lost 200..."
+                }
+                className="w-full bg-[#0B0E14] border border-[#2A2D33] rounded-lg px-3 py-3 text-[#E0E6ED] placeholder-[#707A8A] focus:outline-none focus:border-[#3df2bc] transition-all min-h-[120px] resize-none"
+              />
+              <Button
+                onClick={handleAiParse}
+                disabled={isAiParsing || !aiPrompt.trim()}
+                className="w-full"
+              >
+                {isAiParsing ? (
+                  <>
+                    <i className="fas fa-spinner fa-spin mr-2" />
+                    Parsing...
+                  </>
+                ) : (
+                  <>
+                    <i className="fas fa-wand-magic-sparkles mr-2" />
+                    Parse & Save with AI
+                  </>
+                )}
+              </Button>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {/* Date, Rate, Note */}
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-xs text-[#707A8A] mb-1">Date</label>
+                  <TableInput
+                    type="date"
+                    value={gameDate}
+                    onChange={(e) => setGameDate(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-[#707A8A] mb-1">$/台</label>
+                  <TableInput
+                    type="number"
+                    min={0.1}
+                    step={0.1}
+                    value={baseRate}
+                    onChange={(e) => setBaseRate(Number(e.target.value))}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-[#707A8A] mb-1">Note</label>
+                  <TableInput
+                    type="text"
+                    value={gameNote}
+                    onChange={(e) => setGameNote(e.target.value)}
+                    placeholder="Optional..."
+                  />
+                </div>
+              </div>
+
+              {/* Seat assignments - cross layout */}
+              <div>
+                <h3 className="text-sm font-semibold text-[#E0E6ED] mb-2">Seats</h3>
+                <div className="grid grid-cols-3 gap-3">
+                  {CROSS_GRID.map((seatIdx, cellIdx) => {
+                    if (seatIdx === null) return <div key={cellIdx} />;
+                    const label = SEAT_LABELS[seatIdx];
+                    return (
+                      <div
+                        key={cellIdx}
+                        className="bg-[#0B0E14] border border-[#2A2D33] rounded-xl p-3"
+                      >
+                        <div className="flex items-center justify-center mb-2 relative">
+                          <span className="text-sm font-bold text-[#FFD700]">{label}</span>
+                          {seatAssignments[seatIdx] && (
+                            <button
+                              onClick={() => clearSeat(seatIdx)}
+                              className="absolute right-0 text-[#707A8A] hover:text-[#FF3131] transition-colors"
+                            >
+                              <i className="fas fa-xmark text-xs" />
+                            </button>
+                          )}
+                        </div>
+
+                        {seatAssignments[seatIdx] ? (
+                          /* Assigned player */
+                          <div className="flex flex-col items-center gap-1">
+                            {(() => {
+                              const vip = vipList.find((v) => v.name === seatAssignments[seatIdx]);
+                              return vip?.image ? (
+                                <img
+                                  src={vip.image}
+                                  alt={seatAssignments[seatIdx]!}
+                                  className="w-8 h-8 rounded-full object-cover"
+                                />
+                              ) : (
+                                <div className="w-8 h-8 rounded-full bg-[#2A2D33] flex items-center justify-center text-xs font-bold text-[#707A8A]">
+                                  {seatAssignments[seatIdx]![0]}
+                                </div>
+                              );
+                            })()}
+                            <span className="text-sm font-medium text-[#E0E6ED] text-center">
+                              {seatAssignments[seatIdx]}
+                            </span>
+                          </div>
+                        ) : selectingSeat === seatIdx ? (
+                          /* VIP picker + custom name */
+                          <div className="space-y-2">
+                            <div className="grid grid-cols-3 gap-1.5">
+                              {vipList
+                                .filter((v) => !seatAssignments.includes(v.name))
+                                .map((vip) => (
+                                  <button
+                                    key={vip.name}
+                                    onClick={() => assignSeat(seatIdx, vip.name)}
+                                    className="flex flex-col items-center gap-0.5 p-1.5 rounded-lg hover:bg-[#2A2D33] transition-colors"
+                                  >
+                                    {vip.image ? (
+                                      <img
+                                        src={vip.image}
+                                        alt={vip.name}
+                                        className="w-8 h-8 rounded-full object-cover"
+                                      />
+                                    ) : (
+                                      <div className="w-8 h-8 rounded-full bg-[#2A2D33] flex items-center justify-center text-xs font-bold text-[#707A8A]">
+                                        {vip.name[0]}
+                                      </div>
+                                    )}
+                                    <span className="text-[10px] text-[#707A8A] truncate w-full text-center">
+                                      {vip.name}
+                                    </span>
+                                  </button>
+                                ))}
+                            </div>
+                            <div className="flex gap-1">
+                              <TableInput
+                                type="text"
+                                placeholder="Or type name..."
+                                value={customName}
+                                onChange={(e) => setCustomName(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' && customName.trim()) {
+                                    assignSeat(seatIdx, customName.trim());
+                                  }
+                                }}
+                                className="text-xs"
+                              />
+                              <button
+                                onClick={() => {
+                                  if (customName.trim()) assignSeat(seatIdx, customName.trim());
+                                }}
+                                className="text-[#3df2bc] px-2 hover:bg-[#2A2D33] rounded-lg transition-colors"
+                              >
+                                <i className="fas fa-check text-xs" />
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          /* Empty seat - tap to select */
+                          <button
+                            onClick={() => {
+                              setSelectingSeat(seatIdx);
+                              setCustomName('');
+                            }}
+                            className="w-full py-2 text-sm text-[#707A8A] hover:text-[#3df2bc] transition-colors"
+                          >
+                            <i className="fas fa-plus mr-1" />
+                            Select Player
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Start game button */}
+              <Button
+                onClick={startGameSession}
+                className="w-full"
+                disabled={seatAssignments.filter(Boolean).length < 4}
+              >
+                <i className="fas fa-play mr-2" />
+                Start Game
+              </Button>
+            </div>
+          )}
+        </Card>
+      </div>
+    );
+  };
+
+  // ─── All Games Tab ──────────────────────────────────────────────────────────
+
+  const renderGamesTab = () => {
+    if (games.length === 0) {
+      return (
+        <Card className="text-center py-8">
+          <i className="fas fa-dice text-4xl text-[#707A8A] mb-3" />
+          <p className="text-[#707A8A]">No games yet... Start by recording a game!</p>
+        </Card>
+      );
+    }
+
+    const sortedGames = [...games].reverse();
+
+    return (
+      <div className="space-y-3">
+        <h2 className="text-lg font-bold text-[#E0E6ED] px-1">
+          All Games <span className="text-sm text-[#707A8A] font-normal">({games.length})</span>
+        </h2>
+        {sortedGames.map((game) => {
+          const specialPlayers = game.players.filter((p) => p.special);
+          const roundCount = game.rounds?.length || 0;
+          return (
+            <Card key={game.id} className="space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-semibold text-[#3df2bc]">{game.date}</span>
+                  {game.note && (
+                    <span className="text-xs text-[#707A8A] bg-[#0B0E14] px-2 py-0.5 rounded-full">
+                      {game.note}
+                    </span>
+                  )}
+                  {roundCount > 0 && (
+                    <span className="text-xs text-[#707A8A] bg-[#0B0E14] px-2 py-0.5 rounded-full">
+                      {roundCount} rounds
+                    </span>
+                  )}
+                  {game.baseRate > 0 && (
+                    <span className="text-xs text-[#707A8A] bg-[#0B0E14] px-2 py-0.5 rounded-full">
+                      ${game.baseRate}/台
+                    </span>
+                  )}
+                </div>
+                <button
+                  onClick={() => handleDeleteGame(game.id)}
+                  className="text-[#707A8A] hover:text-[#FF3131] transition-colors px-2 py-1"
+                  title="Delete game"
+                >
+                  <i className="fas fa-trash text-xs" />
+                </button>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                {game.players.map((player, i) => (
+                  <span
+                    key={i}
+                    className={`text-sm px-2 py-1 rounded-lg ${
+                      player.score > 0
+                        ? 'bg-[#3df2bc]/10 text-[#3df2bc]'
+                        : player.score < 0
+                          ? 'bg-[#FF3131]/10 text-[#FF3131]'
+                          : 'bg-[#2A2D33] text-[#E0E6ED]'
+                    }`}
+                  >
+                    {player.name}{' '}
+                    <span className="font-semibold">
+                      {player.score > 0 ? '+' : ''}
+                      {player.score}
+                    </span>
+                  </span>
+                ))}
+              </div>
+
+              {specialPlayers.length > 0 && (
+                <div className="text-xs text-[#FFD700]">
+                  <i className="fas fa-star mr-1" />
+                  {specialPlayers.map((p) => `${p.name}: ${p.special}`).join(' | ')}
+                </div>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+    );
+  };
+
+  // ─── Yearly Review Tab ──────────────────────────────────────────────────────
+
+  const renderReviewTab = () => {
+    if (yearlyData.length === 0) {
+      return (
+        <Card className="text-center py-8">
+          <i className="fas fa-chart-line text-4xl text-[#707A8A] mb-3" />
+          <p className="text-[#707A8A]">Add games to generate yearly insights.</p>
+        </Card>
+      );
+    }
+
+    return (
+      <div className="space-y-6">
+        {yearlyData.map(({ year, stats }) => {
+          const mostMoneyWinTop3 = pickTopPlayers(stats, {
+            getValue: (s) => s.totalScore,
+            requirePositive: false,
+            formatValue: (v) => String(v),
+          });
+          const mostLossesTop3 = pickTopPlayers(stats, {
+            getValue: (s) => s.losses,
+            requirePositive: true,
+            formatValue: (v) => String(v),
+          });
+          const mostMoneyLoseTop3 = pickBottomPlayers(stats, {
+            getValue: (s) => s.totalScore,
+            requireNegative: true,
+            formatValue: (v) => String(v),
+          });
+          const maxSingleHandTop3 = pickTopSpecialHands(stats);
+
+          const analysis = aiAnalysis[year];
+
+          return (
+            <div key={year} className="space-y-3">
+              <div className="flex items-center justify-between px-1">
+                <h2 className="text-xl font-bold text-[#E0E6ED]">Year {year}</h2>
+                <Button
+                  variant="secondary"
+                  onClick={() => handleAiAnalyze(year)}
+                  disabled={isAiAnalyzing === year}
+                  className="text-sm px-3 py-1"
+                >
+                  {isAiAnalyzing === year ? (
+                    <>
+                      <i className="fas fa-spinner fa-spin mr-1" />
+                      Analyzing...
+                    </>
+                  ) : (
+                    <>
+                      <i className="fas fa-wand-magic-sparkles mr-1" />
+                      AI Analysis
+                    </>
+                  )}
+                </Button>
+              </div>
+
+              {/* Metrics Table */}
+              <Card>
+                <h3 className="text-sm font-semibold text-[#707A8A] mb-3 uppercase tracking-wide">
+                  Rankings
+                </h3>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-[#2A2D33]">
+                        <th className="text-left py-2 text-[#707A8A] font-medium">Metric</th>
+                        <th className="text-left py-2 text-[#FFD700] font-medium">1st</th>
+                        <th className="text-left py-2 text-[#C0C0C0] font-medium">2nd</th>
+                        <th className="text-left py-2 text-[#CD7F32] font-medium">3rd</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-[#E0E6ED]">
+                      <tr className="border-b border-[#2A2D33]/50">
+                        <td className="py-2">嬴最多錢</td>
+                        <td className="py-2">{mostMoneyWinTop3[0] || '—'}</td>
+                        <td className="py-2">{mostMoneyWinTop3[1] || '—'}</td>
+                        <td className="py-2">{mostMoneyWinTop3[2] || '—'}</td>
+                      </tr>
+                      <tr className="border-b border-[#2A2D33]/50">
+                        <td className="py-2">出統最多次</td>
+                        <td className="py-2">{mostLossesTop3[0] || '—'}</td>
+                        <td className="py-2">{mostLossesTop3[1] || '—'}</td>
+                        <td className="py-2">{mostLossesTop3[2] || '—'}</td>
+                      </tr>
+                      <tr className="border-b border-[#2A2D33]/50">
+                        <td className="py-2">輸最多</td>
+                        <td className="py-2">{mostMoneyLoseTop3[0] || '—'}</td>
+                        <td className="py-2">{mostMoneyLoseTop3[1] || '—'}</td>
+                        <td className="py-2">{mostMoneyLoseTop3[2] || '—'}</td>
+                      </tr>
+                      <tr>
+                        <td className="py-2">單次嬴最多台</td>
+                        <td className="py-2">{maxSingleHandTop3[0] || '—'}</td>
+                        <td className="py-2">{maxSingleHandTop3[1] || '—'}</td>
+                        <td className="py-2">{maxSingleHandTop3[2] || '—'}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+
+              {/* Player Stats Table */}
+              <Card>
+                <h3 className="text-sm font-semibold text-[#707A8A] mb-3 uppercase tracking-wide">
+                  Player Stats
+                </h3>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-[#2A2D33]">
+                        <th className="text-left py-2 text-[#707A8A] font-medium">Player</th>
+                        <th className="text-right py-2 text-[#707A8A] font-medium">Games</th>
+                        <th className="text-right py-2 text-[#707A8A] font-medium">Total</th>
+                        <th className="text-right py-2 text-[#707A8A] font-medium">Wins</th>
+                        <th className="text-right py-2 text-[#707A8A] font-medium">出統</th>
+                        <th className="text-right py-2 text-[#707A8A] font-medium">Special</th>
+                        <th className="text-left py-2 text-[#707A8A] font-medium">Detail</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-[#E0E6ED]">
+                      {[...stats]
+                        .sort((a, b) => b.totalScore - a.totalScore)
+                        .map((s) => (
+                          <tr key={s.name} className="border-b border-[#2A2D33]/50">
+                            <td className="py-2 font-medium">{s.name}</td>
+                            <td className="py-2 text-right">{s.gamesPlayed}</td>
+                            <td
+                              className={`py-2 text-right font-semibold ${
+                                s.totalScore > 0
+                                  ? 'text-[#3df2bc]'
+                                  : s.totalScore < 0
+                                    ? 'text-[#FF3131]'
+                                    : ''
+                              }`}
+                            >
+                              {s.totalScore > 0 ? '+' : ''}
+                              {s.totalScore}
+                            </td>
+                            <td className="py-2 text-right">{s.wins}</td>
+                            <td className="py-2 text-right">{s.losses}</td>
+                            <td className="py-2 text-right">{s.specialCount}</td>
+                            <td className="py-2 text-xs text-[#707A8A]">
+                              {formatSpecialBreakdown(s.specialBreakdown)}
+                            </td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+
+              {/* AI Analysis Results */}
+              {analysis && (
+                <Card className="border-[#3df2bc]/30">
+                  <h3 className="text-sm font-semibold text-[#3df2bc] mb-3">
+                    <i className="fas fa-wand-magic-sparkles mr-1" />
+                    AI Analysis
+                  </h3>
+
+                  <p className="text-[#E0E6ED] mb-4">{analysis.summary}</p>
+
+                  {analysis.playerInsights.length > 0 && (
+                    <div className="space-y-2 mb-4">
+                      <h4 className="text-xs font-semibold text-[#707A8A] uppercase tracking-wide">
+                        Player Insights
+                      </h4>
+                      {analysis.playerInsights.map((pi, i) => (
+                        <div key={i} className="bg-[#0B0E14] rounded-lg p-3">
+                          <span className="font-semibold text-[#3df2bc]">{pi.name}</span>
+                          <span className="text-[#E0E6ED] ml-2">{pi.insight}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {analysis.funFacts.length > 0 && (
+                    <div>
+                      <h4 className="text-xs font-semibold text-[#707A8A] uppercase tracking-wide mb-2">
+                        Fun Facts
+                      </h4>
+                      <ul className="space-y-1">
+                        {analysis.funFacts.map((fact, i) => (
+                          <li key={i} className="text-sm text-[#E0E6ED]">
+                            <span className="text-[#FFD700] mr-1">★</span> {fact}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </Card>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  // ─── Main Render ────────────────────────────────────────────────────────────
+
+  return (
+    <div className="min-h-screen bg-[#0B0E14] text-[#E0E6ED] pb-24">
+      {/* Mahjong Reference Modal */}
+      {showMahjong && <MahjongReferenceModal onClose={() => setShowMahjong(false)} />}
+
+      {/* Header */}
+      <header className="sticky top-0 z-30 bg-[#0B0E14]/95 backdrop-blur border-b border-[#2A2D33]">
+        <div className="max-w-2xl mx-auto px-4 py-3 flex items-center justify-between">
+          <div>
+            <h1 className="text-xl font-bold text-[#E0E6ED]">
+              Mahjong Leaderboard
+            </h1>
+            <p className="text-xs text-[#707A8A]">Record games & review yearly performance</p>
+          </div>
+          <button
+            onClick={() => setShowMahjong(true)}
+            className="text-[#707A8A] hover:text-[#FFD700] transition-colors px-2 py-1"
+            title="台數列表"
+          >
+            <i className="fas fa-book text-lg" />
+          </button>
+        </div>
+      </header>
+
+      {/* Content */}
+      <main className="max-w-2xl mx-auto px-4 py-4">
+        {activeTab === 'record' && renderRecordTab()}
+        {activeTab === 'games' && renderGamesTab()}
+        {activeTab === 'review' && renderReviewTab()}
+      </main>
+
+      {/* Bottom Navigation */}
+      <nav className="fixed bottom-0 left-0 right-0 bg-[#1A1D23] border-t border-[#2A2D33] z-40">
+        <div className="max-w-2xl mx-auto px-6 py-3 flex justify-around items-center">
+          <NavButton
+            active={activeTab === 'record'}
+            onClick={() => setActiveTab('record')}
+            icon="fa-plus-circle"
+            label="Record"
+          />
+          <NavButton
+            active={activeTab === 'games'}
+            onClick={() => setActiveTab('games')}
+            icon="fa-list"
+            label="Games"
+          />
+          <NavButton
+            active={activeTab === 'review'}
+            onClick={() => setActiveTab('review')}
+            icon="fa-trophy"
+            label="Review"
+          />
+        </div>
+      </nav>
+    </div>
+  );
+}
