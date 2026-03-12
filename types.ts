@@ -8,11 +8,15 @@ export interface Player {
 export interface Round {
   id: string;
   winnerSeat: number;
-  winType: 'zimo' | 'chutong';
+  winType: 'zimo' | 'chutong' | 'draw';
   loserSeat?: number;
   fan: number;
   special: string;
   dealerStreak?: number;
+  // Multi-winner fields (一炮雙響 / 一炮三響)
+  winnerSeats?: number[];
+  fans?: number[];
+  specials?: string[];
 }
 
 export interface Game {

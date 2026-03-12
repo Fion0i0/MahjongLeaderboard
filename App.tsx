@@ -82,12 +82,25 @@ function pickTopConsecutiveDealer(games: Game[]): string[] {
   const maxStreaks = new Map<string, number>();
 
   for (const game of games) {
+    let ds = 0, dk = 0;
     for (const round of game.rounds) {
-      const streak = round.dealerStreak || 0;
-      if (streak > 0) {
-        const name = game.seats[round.winnerSeat];
+      if (round.winType === 'draw') {
+        dk++;
+        const name = game.seats[ds];
         const prev = maxStreaks.get(name) || 0;
-        if (streak > prev) maxStreaks.set(name, streak);
+        if (dk > prev) maxStreaks.set(name, dk);
+        continue;
+      }
+      const winners = round.winnerSeats && round.winnerSeats.length > 1
+        ? round.winnerSeats : [round.winnerSeat];
+      if (winners.includes(ds)) {
+        dk++;
+        const name = game.seats[ds];
+        const prev = maxStreaks.get(name) || 0;
+        if (dk > prev) maxStreaks.set(name, dk);
+      } else {
+        ds = (ds + 1) % 4;
+        dk = 0;
       }
     }
   }
@@ -175,19 +188,57 @@ function computeScoresFromRounds(seats: string[], rounds: Round[], baseRate: num
   const scores = [0, 0, 0, 0];
   const specials: string[][] = [[], [], [], []];
 
+  let dealerSeat = 0;
+  let dealerStreak = 0;
+
   for (const round of rounds) {
     const amount = round.fan * baseRate;
+    const dealerExtra = (2 * dealerStreak + 1) * baseRate;
+
+    // Draw: no score change, dealer stays with 連莊
+    if (round.winType === 'draw') { dealerStreak++; continue; }
+
+    const winners = round.winnerSeats && round.winnerSeats.length > 1
+      ? round.winnerSeats : [round.winnerSeat];
+
     if (round.winType === 'zimo') {
-      scores[round.winnerSeat] += amount * 3;
+      // Non-dealer 自摸: dealer pays extra (2N+1); dealer 自摸: no extra
       for (let i = 0; i < 4; i++) {
-        if (i !== round.winnerSeat) scores[i] -= amount;
+        if (i !== round.winnerSeat) {
+          const extra = (i === dealerSeat && round.winnerSeat !== dealerSeat) ? dealerExtra : 0;
+          scores[i] -= (amount + extra);
+          scores[round.winnerSeat] += (amount + extra);
+        }
       }
     } else if (round.loserSeat !== undefined) {
-      scores[round.winnerSeat] += amount;
-      scores[round.loserSeat] -= amount;
+      if (winners.length > 1 && round.fans) {
+        // 一炮雙響 / 一炮三響: loser pays each winner their individual fan
+        for (let w = 0; w < winners.length; w++) {
+          const winnerAmount = round.fans[w] * baseRate;
+          scores[winners[w]] += winnerAmount;
+          scores[round.loserSeat] -= winnerAmount;
+        }
+      } else {
+        scores[round.winnerSeat] += amount;
+        scores[round.loserSeat] -= amount;
+      }
     }
-    if (round.special) {
+
+    // Specials
+    if (winners.length > 1 && round.specials) {
+      winners.forEach((seat, idx) => {
+        if (round.specials![idx]) specials[seat].push(round.specials![idx]);
+      });
+    } else if (round.special) {
       specials[round.winnerSeat].push(round.special);
+    }
+
+    // Update dealer: stays if any winner is dealer, rotates otherwise
+    if (winners.includes(dealerSeat)) {
+      dealerStreak++;
+    } else {
+      dealerSeat = (dealerSeat + 1) % 4;
+      dealerStreak = 0;
     }
   }
 
@@ -306,16 +357,30 @@ export default function App() {
     baseRate: number;
     seats: string[];
     rounds: Round[];
+    dealerSeat: number;
+    dealerStreak: number;
   } | null>(null);
 
   // Round form
-  const [roundWinner, setRoundWinner] = useState<number | null>(null);
+  const [roundWinners, setRoundWinners] = useState<number[]>([]);
   const [roundWinType, setRoundWinType] = useState<'zimo' | 'chutong' | null>(null);
   const [roundLoser, setRoundLoser] = useState<number | null>(null);
-  const [roundFan, setRoundFan] = useState(3);
-  const [roundSpecial, setRoundSpecial] = useState('');
-  const [roundDealerStreak, setRoundDealerStreak] = useState(0);
-  const [fanCalcText, setFanCalcText] = useState('');
+  const [roundFans, setRoundFans] = useState<Map<number, number>>(new Map());
+  const [roundSpecials, setRoundSpecials] = useState<Map<number, string>>(new Map());
+  const [fanCalcTexts, setFanCalcTexts] = useState<Map<number, string>>(new Map());
+  const [editingRoundId, setEditingRoundId] = useState<string | null>(null);
+  const [activeWinnerTab, setActiveWinnerTab] = useState<number | null>(null);
+
+  const resetRoundForm = () => {
+    setRoundWinners([]);
+    setRoundWinType(null);
+    setRoundLoser(null);
+    setRoundFans(new Map());
+    setRoundSpecials(new Map());
+    setFanCalcTexts(new Map());
+    setEditingRoundId(null);
+    setActiveWinnerTab(null);
+  };
 
   // AI mode
   const [aiMode, setAiMode] = useState(false);
@@ -349,7 +414,11 @@ export default function App() {
     if (showHome) return;
     const unsubscribe = loadDraftSession((draft) => {
       if (draft && draft.seats.length === 4) {
-        setGameSession(draft);
+        setGameSession({
+          ...draft,
+          dealerSeat: (draft as any).dealerSeat ?? 0,
+          dealerStreak: (draft as any).dealerStreak ?? 0,
+        });
         setActiveTab('record');
       }
     });
@@ -373,6 +442,45 @@ export default function App() {
     games.forEach((g) => g.players.forEach((p) => names.add(p.name)));
     return Array.from(names);
   }, [games]);
+
+  const roundTransfers = useMemo(() => {
+    if (!gameSession) return [];
+    const { rounds, baseRate } = gameSession;
+    const result: number[][] = [];
+    let ds = 0, dk = 0;
+    for (const round of rounds) {
+      const t = [0, 0, 0, 0];
+      if (round.winType === 'draw') { result.push(t); dk++; continue; }
+      const winners = round.winnerSeats && round.winnerSeats.length > 1
+        ? round.winnerSeats : [round.winnerSeat];
+      if (round.winType === 'zimo') {
+        const amount = round.fan * baseRate;
+        const dealerExtra = (2 * dk + 1) * baseRate;
+        for (let i = 0; i < 4; i++) {
+          if (i !== round.winnerSeat) {
+            const extra = (i === ds && round.winnerSeat !== ds) ? dealerExtra : 0;
+            t[i] -= (amount + extra);
+            t[round.winnerSeat] += (amount + extra);
+          }
+        }
+      } else if (round.loserSeat !== undefined) {
+        if (winners.length > 1 && round.fans) {
+          for (let w = 0; w < winners.length; w++) {
+            const winnerAmount = round.fans[w] * baseRate;
+            t[winners[w]] += winnerAmount;
+            t[round.loserSeat] -= winnerAmount;
+          }
+        } else {
+          const amount = round.fan * baseRate;
+          t[round.winnerSeat] += amount;
+          t[round.loserSeat] -= amount;
+        }
+      }
+      result.push(t);
+      if (winners.includes(ds)) { dk++; } else { ds = (ds + 1) % 4; dk = 0; }
+    }
+    return result;
+  }, [gameSession]);
 
   // ─── Seat Assignment Handlers ─────────────────────────────────────────────
 
@@ -414,55 +522,175 @@ export default function App() {
       baseRate,
       seats: seatAssignments as string[],
       rounds: [],
+      dealerSeat: 0,
+      dealerStreak: 0,
     });
   };
 
   const addRound = () => {
-    if (roundWinner === null) {
-      alert('Please select a winner.');
+    if (roundWinType === null) {
+      alert('Please select 有人出統, 又自摸 or 流局.');
       return;
     }
-    if (roundWinType === null) {
-      alert('Please select 有人出統 or 又自摸.');
+
+    // Draw: no winner/loser/fan needed
+    if (roundWinType === 'draw') {
+      const drawRound: Round = {
+        id: editingRoundId || crypto.randomUUID(),
+        winnerSeat: -1,
+        winType: 'draw',
+        fan: 0,
+        special: '',
+      };
+      if (editingRoundId) {
+        setGameSession((prev) =>
+          prev ? { ...prev, rounds: prev.rounds.map((r) => r.id === editingRoundId ? drawRound : r) } : prev
+        );
+      } else {
+        // Dealer stays, 連莊 on draw
+        setGameSession((prev) =>
+          prev ? { ...prev, rounds: [...prev.rounds, drawRound], dealerStreak: prev.dealerStreak + 1 } : prev
+        );
+      }
+      resetRoundForm();
+      return;
+    }
+
+    if (roundWinners.length === 0) {
+      alert('Please select a winner.');
       return;
     }
     if (roundWinType === 'chutong' && roundLoser === null) {
       alert('Please select who discarded (出統者).');
       return;
     }
-    if (roundFan <= 0) {
-      alert('台數 must be greater than 0.');
+    for (const seat of roundWinners) {
+      const fan = roundFans.get(seat) ?? 3;
+      if (fan <= 0) {
+        alert(`${gameSession!.seats[seat]} 台數 must be greater than 0.`);
+        return;
+      }
+    }
+
+    const firstWinner = roundWinners[0];
+    const firstFan = roundFans.get(firstWinner) ?? 3;
+    const firstSpecial = roundSpecials.get(firstWinner) ?? '';
+    const isMultiWinner = roundWinners.length > 1;
+
+    if (editingRoundId) {
+      // Update existing round
+      const updatedRound: Round = {
+        id: editingRoundId,
+        winnerSeat: firstWinner,
+        winType: roundWinType,
+        ...(roundWinType === 'chutong' ? { loserSeat: roundLoser! } : {}),
+        fan: firstFan,
+        special: firstSpecial,
+        ...(isMultiWinner ? {
+          winnerSeats: [...roundWinners],
+          fans: roundWinners.map(s => roundFans.get(s) ?? 3),
+          specials: roundWinners.map(s => roundSpecials.get(s) ?? ''),
+        } : {}),
+      };
+
+      // Preserve dealerStreak from original round if it had one
+      const original = gameSession!.rounds.find((r) => r.id === editingRoundId);
+      if (original?.dealerStreak) {
+        updatedRound.dealerStreak = original.dealerStreak;
+      }
+
+      setGameSession((prev) =>
+        prev ? {
+          ...prev,
+          rounds: prev.rounds.map((r) => r.id === editingRoundId ? updatedRound : r),
+        } : prev
+      );
+    } else {
+      // Add new round — dealer stays if ANY winner is the dealer
+      const dealerAmongWinners = roundWinners.includes(gameSession!.dealerSeat);
+      const newStreak = dealerAmongWinners ? gameSession!.dealerStreak + 1 : 0;
+
+      const newRound: Round = {
+        id: crypto.randomUUID(),
+        winnerSeat: firstWinner,
+        winType: roundWinType,
+        ...(roundWinType === 'chutong' ? { loserSeat: roundLoser! } : {}),
+        fan: firstFan,
+        special: firstSpecial,
+        ...(dealerAmongWinners ? { dealerStreak: newStreak } : {}),
+        ...(isMultiWinner ? {
+          winnerSeats: [...roundWinners],
+          fans: roundWinners.map(s => roundFans.get(s) ?? 3),
+          specials: roundWinners.map(s => roundSpecials.get(s) ?? ''),
+        } : {}),
+      };
+
+      const nextDealerSeat = dealerAmongWinners
+        ? gameSession!.dealerSeat
+        : (gameSession!.dealerSeat + 1) % 4;
+
+      setGameSession((prev) =>
+        prev ? {
+          ...prev,
+          rounds: [...prev.rounds, newRound],
+          dealerSeat: nextDealerSeat,
+          dealerStreak: dealerAmongWinners ? newStreak : 0,
+        } : prev
+      );
+    }
+
+    resetRoundForm();
+  };
+
+  const editRound = (round: Round) => {
+    setEditingRoundId(round.id);
+    setRoundWinType(round.winType);
+    setRoundLoser(round.loserSeat ?? null);
+
+    if (round.winType === 'draw') {
+      setRoundWinners([]);
+      setRoundFans(new Map());
+      setRoundSpecials(new Map());
+      setFanCalcTexts(new Map());
+      setActiveWinnerTab(null);
       return;
     }
 
-    const newRound: Round = {
-      id: crypto.randomUUID(),
-      winnerSeat: roundWinner,
-      winType: roundWinType,
-      ...(roundWinType === 'chutong' ? { loserSeat: roundLoser! } : {}),
-      fan: roundFan,
-      special: roundSpecial,
-      ...(roundDealerStreak > 0 ? { dealerStreak: roundDealerStreak } : {}),
-    };
-
-    setGameSession((prev) =>
-      prev ? { ...prev, rounds: [...prev.rounds, newRound] } : prev
-    );
-
-    // Reset round form
-    setRoundWinner(null);
-    setRoundWinType(null);
-    setRoundLoser(null);
-    setRoundFan(3);
-    setRoundSpecial('');
-    setRoundDealerStreak(0);
-    setFanCalcText('');
+    if (round.winnerSeats && round.winnerSeats.length > 1) {
+      setRoundWinners(round.winnerSeats);
+      const fansMap = new Map<number, number>();
+      const specialsMap = new Map<number, string>();
+      round.winnerSeats.forEach((seat, idx) => {
+        fansMap.set(seat, round.fans?.[idx] ?? round.fan);
+        specialsMap.set(seat, round.specials?.[idx] ?? '');
+      });
+      setRoundFans(fansMap);
+      setRoundSpecials(specialsMap);
+      setActiveWinnerTab(round.winnerSeats[0]);
+    } else {
+      setRoundWinners([round.winnerSeat]);
+      setRoundFans(new Map([[round.winnerSeat, round.fan]]));
+      setRoundSpecials(new Map([[round.winnerSeat, round.special]]));
+      setActiveWinnerTab(round.winnerSeat);
+    }
+    setFanCalcTexts(new Map());
   };
 
   const deleteRound = (roundId: string) => {
-    setGameSession((prev) =>
-      prev ? { ...prev, rounds: prev.rounds.filter((r) => r.id !== roundId) } : prev
-    );
+    setGameSession((prev) => {
+      if (!prev) return prev;
+      const remaining = prev.rounds.filter((r) => r.id !== roundId);
+      let ds = 0, dk = 0;
+      for (const r of remaining) {
+        if (r.winType === 'draw') { dk++; continue; }
+        const winners = r.winnerSeats && r.winnerSeats.length > 1
+          ? r.winnerSeats : [r.winnerSeat];
+        if (winners.includes(ds)) { dk++; }
+        else { ds = (ds + 1) % 4; dk = 0; }
+      }
+      return { ...prev, rounds: remaining, dealerSeat: ds, dealerStreak: dk };
+    });
+    if (editingRoundId === roundId) resetRoundForm();
   };
 
   const endGameAndSave = async () => {
@@ -530,6 +758,8 @@ export default function App() {
       baseRate: game.baseRate,
       seats: game.seats,
       rounds: game.rounds || [],
+      dealerSeat: (game as any).dealerSeat ?? 0,
+      dealerStreak: (game as any).dealerStreak ?? 0,
     });
     deleteGameFromDB(game.id);
     setActiveTab('record');
@@ -721,7 +951,12 @@ export default function App() {
                         {name[0]}
                       </div>
                     )}
-                    <span className="text-xs text-[#FFD700]">{SEAT_LABELS[seatIdx]}</span>
+                    <span className="text-xs text-[#FFD700]">
+                      {SEAT_LABELS[seatIdx]}
+                      {seatIdx === gameSession.dealerSeat && (
+                        <span className="ml-0.5 text-[#FF6B35]">莊{gameSession.dealerStreak > 0 ? `(${gameSession.dealerStreak})` : ''}</span>
+                      )}
+                    </span>
                     <span className="text-xs font-medium text-[#E0E6ED] truncate w-full">
                       {name}
                     </span>
@@ -747,40 +982,15 @@ export default function App() {
           <Card>
             <h3 className="text-sm font-semibold text-[#E0E6ED] mb-3">食胡未?</h3>
 
-            {/* Winner selection */}
-            <div className="mb-3">
-              <label className="block text-xs text-[#707A8A] mb-1">邊個又食胡</label>
-              <div className="grid grid-cols-4 gap-2">
-                {gameSession.seats.map((name, i) => (
-                  <button
-                    key={i}
-                    type="button"
-                    onClick={() => {
-                      setRoundWinner(i);
-                      if (roundLoser === i) setRoundLoser(null);
-                    }}
-                    className={`px-2 py-2 rounded-lg text-xs font-medium text-center transition-all ${
-                      roundWinner === i
-                        ? 'bg-[#3df2bc] text-[#0B0E14]'
-                        : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] hover:border-[#3df2bc]'
-                    }`}
-                  >
-                    {name}
-                  </button>
-                ))}
-              </div>
-            </div>
-
             {/* Win type */}
             <div className="mb-3">
               <label className="block text-xs text-[#707A8A] mb-1">點食先</label>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-3 gap-2">
                 <button
                   type="button"
                   onClick={() => {
                     setRoundWinType('chutong');
                     setRoundLoser(null);
-                    alert('邊個又出統');
                   }}
                   className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${
                     roundWinType === 'chutong'
@@ -795,6 +1005,15 @@ export default function App() {
                   onClick={() => {
                     setRoundWinType('zimo');
                     setRoundLoser(null);
+                    // Trim to single winner if multiple selected
+                    if (roundWinners.length > 1) {
+                      const first = roundWinners[0];
+                      setRoundWinners([first]);
+                      setRoundFans(new Map([[first, roundFans.get(first) ?? 3]]));
+                      setRoundSpecials(new Map([[first, roundSpecials.get(first) ?? '']]));
+                      setFanCalcTexts(new Map([[first, fanCalcTexts.get(first) ?? '']]));
+                      setActiveWinnerTab(first);
+                    }
                   }}
                   className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${
                     roundWinType === 'zimo'
@@ -804,105 +1023,244 @@ export default function App() {
                 >
                   又自摸 !!!
                 </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRoundWinType('draw');
+                    setRoundLoser(null);
+                    setRoundWinners([]);
+                    setRoundFans(new Map());
+                    setRoundSpecials(new Map());
+                    setFanCalcTexts(new Map());
+                    setActiveWinnerTab(null);
+                  }}
+                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${
+                    roundWinType === 'draw'
+                      ? 'bg-[#707A8A] text-white'
+                      : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
+                  }`}
+                >
+                  流局
+                </button>
+              </div>
+            </div>
+
+            {/* Winner / Loser / Fan sections (hidden for draw) */}
+            {roundWinType !== 'draw' && (<>
+            <div className="mb-3">
+              <label className="block text-xs text-[#707A8A] mb-1">
+                邊個又食胡
+                {roundWinType === 'chutong' && roundWinners.length === 2 && (
+                  <span className="text-[#FFD700] ml-2">一炮雙響</span>
+                )}
+                {roundWinType === 'chutong' && roundWinners.length === 3 && (
+                  <span className="text-[#FFD700] ml-2">一炮三響</span>
+                )}
+              </label>
+              <div className="grid grid-cols-4 gap-2">
+                {gameSession.seats.map((name, i) => (
+                  <button
+                    key={i}
+                    type="button"
+                    onClick={() => {
+                      if (roundWinType === 'chutong') {
+                        // Multi-select mode for chutong
+                        setRoundWinners(prev => {
+                          if (prev.includes(i)) {
+                            const next = prev.filter(w => w !== i);
+                            setRoundFans(m => { const n = new Map(m); n.delete(i); return n; });
+                            setRoundSpecials(m => { const n = new Map(m); n.delete(i); return n; });
+                            setFanCalcTexts(m => { const n = new Map(m); n.delete(i); return n; });
+                            if (activeWinnerTab === i) setActiveWinnerTab(next[0] ?? null);
+                            return next;
+                          } else if (prev.length < 3) {
+                            setRoundFans(m => new Map(m).set(i, 3));
+                            setRoundSpecials(m => new Map(m).set(i, ''));
+                            setFanCalcTexts(m => new Map(m).set(i, ''));
+                            setActiveWinnerTab(i);
+                            if (roundLoser === i) setRoundLoser(null);
+                            return [...prev, i];
+                          }
+                          return prev;
+                        });
+                      } else {
+                        // Single-select mode for zimo or no type yet
+                        if (roundWinners.includes(i) && roundWinners.length === 1) {
+                          setRoundWinners([]);
+                          setRoundFans(new Map());
+                          setRoundSpecials(new Map());
+                          setFanCalcTexts(new Map());
+                          setActiveWinnerTab(null);
+                        } else {
+                          setRoundWinners([i]);
+                          setRoundFans(new Map([[i, 3]]));
+                          setRoundSpecials(new Map([[i, '']]));
+                          setFanCalcTexts(new Map([[i, '']]));
+                          setActiveWinnerTab(i);
+                          if (roundLoser === i) setRoundLoser(null);
+                        }
+                      }
+                    }}
+                    className={`px-2 py-2 rounded-lg text-xs font-medium text-center transition-all ${
+                      roundWinners.includes(i)
+                        ? 'bg-[#3df2bc] text-[#0B0E14]'
+                        : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] hover:border-[#3df2bc]'
+                    }`}
+                  >
+                    {name}
+                  </button>
+                ))}
               </div>
             </div>
 
             {/* Loser (if chutong) */}
-            {roundWinType === 'chutong' && (
-              <div className="mb-3">
-                <label className="block text-xs text-[#707A8A] mb-1">邊個又出統</label>
-                <div className="grid grid-cols-3 gap-2">
-                  {gameSession.seats.map((name, i) => {
-                    if (i === roundWinner) return null;
-                    return (
-                      <button
-                        key={i}
-                        type="button"
-                        onClick={() => setRoundLoser(i)}
-                        className={`px-2 py-2 rounded-lg text-xs font-medium text-center transition-all ${
-                          roundLoser === i
-                            ? 'bg-[#FF3131] text-white'
-                            : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] hover:border-[#FF3131]'
-                        }`}
-                      >
-                        {name}
-                      </button>
-                    );
-                  })}
+            {roundWinType === 'chutong' && (() => {
+              const nonWinners = [0, 1, 2, 3].filter(i => !roundWinners.includes(i));
+              // Auto-select loser when only 1 non-winner remains (一炮三響)
+              if (nonWinners.length === 1 && roundLoser !== nonWinners[0]) {
+                setTimeout(() => setRoundLoser(nonWinners[0]), 0);
+              }
+              return (
+                <div className="mb-3">
+                  <label className="block text-xs text-[#707A8A] mb-1">邊個又出統</label>
+                  {nonWinners.length === 1 ? (
+                    <div className="text-sm text-[#FF3131] font-medium px-3 py-2 bg-[#FF3131]/10 rounded-lg">
+                      {gameSession.seats[nonWinners[0]]}
+                    </div>
+                  ) : (
+                    <div className={`grid grid-cols-${nonWinners.length} gap-2`}>
+                      {nonWinners.map(i => (
+                        <button
+                          key={i}
+                          type="button"
+                          onClick={() => setRoundLoser(i)}
+                          className={`px-2 py-2 rounded-lg text-xs font-medium text-center transition-all ${
+                            roundLoser === i
+                              ? 'bg-[#FF3131] text-white'
+                              : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] hover:border-[#FF3131]'
+                          }`}
+                        >
+                          {gameSession.seats[i]}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* Winner tabs for multi-winner */}
+            {roundWinners.length > 1 && (
+              <div className="mb-2">
+                <label className="block text-xs text-[#707A8A] mb-1">
+                  {roundWinners.length === 2 ? '一炮雙響' : '一炮三響'} — 每人台數
+                </label>
+                <div className="flex gap-2">
+                  {roundWinners.map(seat => (
+                    <button
+                      key={seat}
+                      type="button"
+                      onClick={() => setActiveWinnerTab(seat)}
+                      className={`flex-1 px-2 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                        activeWinnerTab === seat
+                          ? 'bg-[#3df2bc] text-[#0B0E14]'
+                          : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
+                      }`}
+                    >
+                      {gameSession.seats[seat]}
+                      <span className="ml-1 opacity-70">({roundFans.get(seat) ?? 3}台)</span>
+                    </button>
+                  ))}
                 </div>
               </div>
             )}
 
-            {/* Fan + Special + 連莊 */}
-            <div className="grid grid-cols-3 gap-2 sm:gap-3 mb-3">
-              <div>
-                <label className="block text-xs text-[#707A8A] mb-1">台數</label>
-                <TableInput
-                  type="number"
-                  min={1}
-                  value={roundFan}
-                  onChange={(e) => setRoundFan(Number(e.target.value))}
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-[#707A8A] mb-1">食咩大牌</label>
-                <SpecialHandPicker value={roundSpecial} onChange={setRoundSpecial} />
-              </div>
-              <div>
-                <label className="block text-xs text-[#707A8A] mb-1">連幾莊</label>
-                <TableInput
-                  type="number"
-                  min={0}
-                  value={roundDealerStreak}
-                  onChange={(e) => setRoundDealerStreak(Number(e.target.value))}
-                />
-              </div>
-            </div>
-
-            {/* Fan Calculator */}
-            <div className="mb-3">
-              <label className="block text-xs text-[#707A8A] mb-1">
-                台數助手 <span className="text-[#3df2bc]">— 人工智障自動計算</span>
-              </label>
-              <input
-                type="text"
-                value={fanCalcText}
-                onChange={(e) => {
-                  const text = e.target.value;
-                  setFanCalcText(text);
-                  if (text.trim()) {
-                    const result = parseFanFromText(text);
-                    if (result.total > 0) setRoundFan(result.total);
-                  }
-                }}
-                placeholder="例: 莊家、連2、正花、碰中"
-                className="w-full bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#3df2bc] placeholder-[#707A8A]"
-              />
-              {fanCalcText.trim() && (() => {
-                const result = parseFanFromText(fanCalcText);
-                if (result.items.length === 0) return null;
-                return (
-                  <div className="mt-1.5 bg-[#0B0E14] rounded-lg px-3 py-2 border border-[#2A2D33]">
-                    <div className="text-xs text-[#707A8A]">
-                      {result.items.map((item, idx) => (
-                        <span key={idx}>
-                          {idx > 0 && <span className="text-[#2A2D33] mx-1">+</span>}
-                          <span className="text-[#E0E6ED]">{item.label}</span>
-                          <span className="text-[#707A8A]">({item.value})</span>
-                        </span>
-                      ))}
-                      <span className="text-[#2A2D33] mx-1">=</span>
-                      <span className="text-[#3df2bc] font-bold">{result.total}台</span>
-                    </div>
+            {/* Fan + Special (per active winner tab) */}
+            {activeWinnerTab !== null && (
+              <>
+                <div className="grid grid-cols-2 gap-2 sm:gap-3 mb-3">
+                  <div>
+                    <label className="block text-xs text-[#707A8A] mb-1">
+                      {roundWinners.length > 1 ? `${gameSession.seats[activeWinnerTab]} 台數` : '台數'}
+                    </label>
+                    <TableInput
+                      type="number"
+                      min={1}
+                      value={roundFans.get(activeWinnerTab) ?? 3}
+                      onChange={(e) => {
+                        const val = Number(e.target.value);
+                        setRoundFans(m => new Map(m).set(activeWinnerTab!, val));
+                      }}
+                    />
                   </div>
-                );
-              })()}
-            </div>
+                  <div>
+                    <label className="block text-xs text-[#707A8A] mb-1">食咩大牌</label>
+                    <SpecialHandPicker
+                      value={roundSpecials.get(activeWinnerTab) ?? ''}
+                      onChange={(val) => setRoundSpecials(m => new Map(m).set(activeWinnerTab!, val))}
+                    />
+                  </div>
+                </div>
 
-            <Button onClick={addRound} className="w-full">
-              <i className="fas fa-plus mr-2" />
-              下局會更好
-            </Button>
+                {/* Fan Calculator */}
+                <div className="mb-3">
+                  <label className="block text-xs text-[#707A8A] mb-1">
+                    台數助手 <span className="text-[#3df2bc]">— 人工智障自動計算</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={fanCalcTexts.get(activeWinnerTab) ?? ''}
+                    onChange={(e) => {
+                      const text = e.target.value;
+                      const tab = activeWinnerTab!;
+                      setFanCalcTexts(m => new Map(m).set(tab, text));
+                      if (text.trim()) {
+                        const result = parseFanFromText(text);
+                        if (result.total > 0) setRoundFans(m => new Map(m).set(tab, result.total));
+                      }
+                    }}
+                    placeholder="例: 莊家、連2、正花、碰中"
+                    className="w-full bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#3df2bc] placeholder-[#707A8A]"
+                  />
+                  {(fanCalcTexts.get(activeWinnerTab) ?? '').trim() && (() => {
+                    const result = parseFanFromText(fanCalcTexts.get(activeWinnerTab) ?? '');
+                    if (result.items.length === 0) return null;
+                    return (
+                      <div className="mt-1.5 bg-[#0B0E14] rounded-lg px-3 py-2 border border-[#2A2D33]">
+                        <div className="text-xs text-[#707A8A]">
+                          {result.items.map((item, idx) => (
+                            <span key={idx}>
+                              {idx > 0 && <span className="text-[#2A2D33] mx-1">+</span>}
+                              <span className="text-[#E0E6ED]">{item.label}</span>
+                              <span className="text-[#707A8A]">({item.value})</span>
+                            </span>
+                          ))}
+                          <span className="text-[#2A2D33] mx-1">=</span>
+                          <span className="text-[#3df2bc] font-bold">{result.total}台</span>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              </>
+            )}
+            </>)}
+
+            <div className="flex gap-2">
+              {editingRoundId && (
+                <Button
+                  variant="secondary"
+                  onClick={() => resetRoundForm()}
+                  className="px-4"
+                >
+                  取消
+                </Button>
+              )}
+              <Button onClick={addRound} className="flex-1">
+                <i className={`fas ${editingRoundId ? 'fa-check' : 'fa-plus'} mr-2`} />
+                {editingRoundId ? '更新' : '下局會更好'}
+              </Button>
+            </div>
           </Card>
 
           {/* Round history */}
@@ -912,43 +1270,103 @@ export default function App() {
                 Rounds ({gameSession.rounds.length})
               </h3>
               <div className="space-y-2">
-                {gameSession.rounds.map((round, idx) => (
-                  <div
-                    key={round.id}
-                    className="flex items-center justify-between bg-[#0B0E14] rounded-lg px-3 py-2"
-                  >
-                    <div className="flex-1 text-sm">
-                      <span className="text-[#707A8A]">#{idx + 1}</span>
-                      <span className="text-[#3df2bc] font-medium ml-2">
-                        {gameSession.seats[round.winnerSeat]}
-                      </span>
-                      <span
-                        className={`ml-1 text-xs px-1.5 py-0.5 rounded ${
-                          round.winType === 'zimo'
-                            ? 'bg-[#FFD700]/20 text-[#FFD700]'
-                            : 'bg-[#FF3131]/20 text-[#FF3131]'
-                        }`}
-                      >
-                        {round.winType === 'zimo' ? '自摸' : '出統'}
-                      </span>
-                      {round.winType === 'chutong' && round.loserSeat !== undefined && (
-                        <span className="text-[#FF3131] text-xs ml-1">
-                          ← {gameSession.seats[round.loserSeat]}
-                        </span>
+                {[...gameSession.rounds].reverse().map((round) => {
+                  const idx = gameSession.rounds.indexOf(round);
+                  const isMultiWinner = round.winnerSeats && round.winnerSeats.length > 1;
+                  return (
+                    <div
+                      key={round.id}
+                      className={`rounded-lg px-3 py-2 ${editingRoundId === round.id ? 'bg-[#3df2bc]/10 border border-[#3df2bc]/30' : 'bg-[#0B0E14]'}`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex-1 text-sm">
+                          <span className="text-[#707A8A]">#{idx + 1}</span>
+                          {round.winType === 'draw' ? (
+                            <span className="text-[#707A8A] font-medium ml-2">流局</span>
+                          ) : isMultiWinner ? (
+                            <>
+                              <span className="text-[#FFD700] font-medium ml-2">
+                                {round.winnerSeats!.length === 2 ? '一炮雙響' : '一炮三響'}
+                              </span>
+                              <span className="ml-1 text-xs px-1.5 py-0.5 rounded bg-[#FF3131]/20 text-[#FF3131]">
+                                出統
+                              </span>
+                              {round.loserSeat !== undefined && (
+                                <span className="text-[#FF3131] text-xs ml-1">
+                                  ← {gameSession.seats[round.loserSeat]}
+                                </span>
+                              )}
+                            </>
+                          ) : (
+                            <>
+                              <span className="text-[#3df2bc] font-medium ml-2">
+                                {gameSession.seats[round.winnerSeat]}
+                              </span>
+                              <span
+                                className={`ml-1 text-xs px-1.5 py-0.5 rounded ${
+                                  round.winType === 'zimo'
+                                    ? 'bg-[#FFD700]/20 text-[#FFD700]'
+                                    : 'bg-[#FF3131]/20 text-[#FF3131]'
+                                }`}
+                              >
+                                {round.winType === 'zimo' ? '自摸' : '出統'}
+                              </span>
+                              {round.winType === 'chutong' && round.loserSeat !== undefined && (
+                                <span className="text-[#FF3131] text-xs ml-1">
+                                  ← {gameSession.seats[round.loserSeat]}
+                                </span>
+                              )}
+                              <span className="text-[#E0E6ED] ml-2">{round.fan}台</span>
+                              {round.special && (
+                                <span className="text-[#FFD700] text-xs ml-2">{round.special}</span>
+                              )}
+                            </>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => editRound(round)}
+                            className={`transition-colors px-2 ${editingRoundId === round.id ? 'text-[#3df2bc]' : 'text-[#707A8A] hover:text-[#3df2bc]'}`}
+                          >
+                            <i className="fas fa-pen text-xs" />
+                          </button>
+                          <button
+                            onClick={() => deleteRound(round.id)}
+                            className="text-[#707A8A] hover:text-[#FF3131] transition-colors px-2"
+                          >
+                            <i className="fas fa-xmark text-xs" />
+                          </button>
+                        </div>
+                      </div>
+                      {isMultiWinner && (
+                        <div className="mt-1 text-xs">
+                          {round.winnerSeats!.map((seat, wIdx) => (
+                            <span key={seat}>
+                              {wIdx > 0 && <span className="text-[#2A2D33] mx-1">|</span>}
+                              <span className="text-[#3df2bc]">{gameSession.seats[seat]}</span>
+                              <span className="text-[#E0E6ED] ml-1">{round.fans?.[wIdx] ?? round.fan}台</span>
+                              {round.specials?.[wIdx] && (
+                                <span className="text-[#FFD700] ml-1">{round.specials[wIdx]}</span>
+                              )}
+                            </span>
+                          ))}
+                        </div>
                       )}
-                      <span className="text-[#E0E6ED] ml-2">{round.fan}台</span>
-                      {round.special && (
-                        <span className="text-[#FFD700] text-xs ml-2">{round.special}</span>
+                      {roundTransfers[idx] && (
+                        <div className="flex gap-3 mt-1 text-xs">
+                          {gameSession.seats.map((name, i) => {
+                            const val = roundTransfers[idx][i];
+                            return (
+                              <span key={i} className={val > 0 ? 'text-[#3df2bc]' : val < 0 ? 'text-[#FF3131]' : 'text-[#707A8A]'}>
+                                {name} {val > 0 ? '+' : ''}{val}
+                              </span>
+                            );
+                          })}
+                        </div>
                       )}
                     </div>
-                    <button
-                      onClick={() => deleteRound(round.id)}
-                      className="text-[#707A8A] hover:text-[#FF3131] transition-colors px-2"
-                    >
-                      <i className="fas fa-xmark text-xs" />
-                    </button>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </Card>
           )}
@@ -1041,6 +1459,7 @@ export default function App() {
                     step={10}
                     value={baseRate}
                     onChange={(e) => setBaseRate(Number(e.target.value))}
+                    placeholder="e.g. 10"
                   />
                 </div>
               </div>
