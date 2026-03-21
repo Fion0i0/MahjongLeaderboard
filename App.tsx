@@ -16,7 +16,7 @@ import {
 
 // ─── Constants ──────────────────────────────────────────────────────────────────
 
-const SEAT_LABELS = ['東', '南', '西', '北'];
+const SEAT_LABELS = ['東', '北', '西', '南'];
 
 // Cross layout: 3x3 grid mapping cell index → seat index
 const CROSS_GRID: (number | null)[] = [null, 0, null, 3, null, 1, null, 2, null];
