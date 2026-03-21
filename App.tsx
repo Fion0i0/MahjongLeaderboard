@@ -17,6 +17,7 @@ import {
 // ─── Constants ──────────────────────────────────────────────────────────────────
 
 const SEAT_LABELS = ['東', '北', '西', '南'];
+const DEALER_ROTATION = [3, 0, 1, 2]; // 東→南→西→北: next dealer by seat index
 
 // Cross layout: 3x3 grid mapping cell index → seat index
 const CROSS_GRID: (number | null)[] = [null, 0, null, 3, null, 1, null, 2, null];
@@ -99,7 +100,7 @@ function pickTopConsecutiveDealer(games: Game[]): string[] {
         const prev = maxStreaks.get(name) || 0;
         if (dk > prev) maxStreaks.set(name, dk);
       } else {
-        ds = (ds + 1) % 4;
+        ds = DEALER_ROTATION[ds];
         dk = 0;
       }
     }
@@ -237,7 +238,7 @@ function computeScoresFromRounds(seats: string[], rounds: Round[], baseRate: num
     if (winners.includes(dealerSeat)) {
       dealerStreak++;
     } else {
-      dealerSeat = (dealerSeat + 1) % 4;
+      dealerSeat = DEALER_ROTATION[dealerSeat];
       dealerStreak = 0;
     }
   }
@@ -477,7 +478,7 @@ export default function App() {
         }
       }
       result.push(t);
-      if (winners.includes(ds)) { dk++; } else { ds = (ds + 1) % 4; dk = 0; }
+      if (winners.includes(ds)) { dk++; } else { ds = DEALER_ROTATION[ds]; dk = 0; }
     }
     return result;
   }, [gameSession]);
@@ -627,7 +628,7 @@ export default function App() {
 
       const nextDealerSeat = dealerAmongWinners
         ? gameSession!.dealerSeat
-        : (gameSession!.dealerSeat + 1) % 4;
+        : DEALER_ROTATION[gameSession!.dealerSeat];
 
       setGameSession((prev) =>
         prev ? {
@@ -686,7 +687,7 @@ export default function App() {
         const winners = r.winnerSeats && r.winnerSeats.length > 1
           ? r.winnerSeats : [r.winnerSeat];
         if (winners.includes(ds)) { dk++; }
-        else { ds = (ds + 1) % 4; dk = 0; }
+        else { ds = DEALER_ROTATION[ds]; dk = 0; }
       }
       return { ...prev, rounds: remaining, dealerSeat: ds, dealerStreak: dk };
     });
