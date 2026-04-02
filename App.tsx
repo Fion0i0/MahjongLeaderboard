@@ -30,6 +30,13 @@ const generateId = (): string =>
     : `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
 
+const RankCell = ({ text }: { text: string }) => {
+  if (!text) return <span>—</span>;
+  const match = text.match(/^(.+?)\s*\((.+)\)$/);
+  if (!match) return <span>{text}</span>;
+  return <span>{match[1]}<br /><span className="text-[#707A8A] text-[10px]">({match[2]})</span></span>;
+};
+
 function pickTopPlayers(
   statsArray: PlayerYearlyStats[],
   options: {
@@ -115,7 +122,7 @@ function pickTopConsecutiveDealer(games: Game[]): string[] {
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 
   if (ranked.length === 0) return [];
-  return ranked.slice(0, 3).map(([name, count]) => `${name} (連${count}莊)`);
+  return ranked.slice(0, 3).map(([name, count]) => `${name} (連${count})`);
 }
 
 function pickTopZimoPlayers(games: Game[]): string[] {
@@ -1812,12 +1819,7 @@ export default function App() {
                   <span className="text-sm font-semibold" style={{backgroundImage: 'linear-gradient(90deg, #ffadad, #ffd6a5, #fdffb6, #caffbf, #9bf6ff, #a0c4ff, #bdb2ff, #ffc6ff)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent'}}>{game.date}</span>
                   {game.note && (
                     <span className="text-xs text-[#707A8A] bg-[#0B0E14] px-2 py-0.5 rounded-full">
-                      底:{game.note}
-                    </span>
-                  )}
-                  {game.baseRate > 0 && (
-                    <span className="text-xs text-[#707A8A] bg-[#0B0E14] px-2 py-0.5 rounded-full">
-                      ${game.baseRate}/台
+                      底:{game.note} ${game.baseRate}/台
                     </span>
                   )}
                   {roundCount > 0 && (
@@ -1848,7 +1850,7 @@ export default function App() {
                 {game.players.map((player, i) => (
                   <span
                     key={i}
-                    className={`text-sm px-2 py-1 rounded-lg ${
+                    className={`text-xs px-2 py-1 rounded-lg ${
                       player.score > 0
                         ? 'bg-[#87DD87]/10 text-[#87DD87]'
                         : player.score < 0
@@ -2041,45 +2043,45 @@ export default function App() {
                     <tbody className="text-[#E0E6ED]">
                       <tr className="border-b border-[#2A2D33]/50">
                         <td className="py-1.5 sm:py-2 pr-2 whitespace-nowrap">嬴哂啲錢</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{mostMoneyWinTop3[0] || '—'}</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{mostMoneyWinTop3[1] || '—'}</td>
-                        <td className="py-1.5 sm:py-2">{mostMoneyWinTop3[2] || '—'}</td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={mostMoneyWinTop3[0]} /></td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={mostMoneyWinTop3[1]} /></td>
+                        <td className="py-1.5 sm:py-2"><RankCell text={mostMoneyWinTop3[2]} /></td>
                       </tr>
                       <tr className="border-b border-[#2A2D33]/50">
                         <td className="py-1.5 sm:py-2 pr-2 whitespace-nowrap">出統王</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{mostLossesTop3[0] || '—'}</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{mostLossesTop3[1] || '—'}</td>
-                        <td className="py-1.5 sm:py-2">{mostLossesTop3[2] || '—'}</td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={mostLossesTop3[0]} /></td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={mostLossesTop3[1]} /></td>
+                        <td className="py-1.5 sm:py-2"><RankCell text={mostLossesTop3[2]} /></td>
                       </tr>
                       <tr className="border-b border-[#2A2D33]/50">
                         <td className="py-1.5 sm:py-2 pr-2 whitespace-nowrap">輸哂啲錢</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{mostMoneyLoseTop3[0] || '—'}</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{mostMoneyLoseTop3[1] || '—'}</td>
-                        <td className="py-1.5 sm:py-2">{mostMoneyLoseTop3[2] || '—'}</td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={mostMoneyLoseTop3[0]} /></td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={mostMoneyLoseTop3[1]} /></td>
+                        <td className="py-1.5 sm:py-2"><RankCell text={mostMoneyLoseTop3[2]} /></td>
                       </tr>
                       <tr className="border-b border-[#2A2D33]/50">
                         <td className="py-1.5 sm:py-2 pr-2 whitespace-nowrap">至尊雀聖</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{maxSingleHandTop3[0] || '—'}</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{maxSingleHandTop3[1] || '—'}</td>
-                        <td className="py-1.5 sm:py-2">{maxSingleHandTop3[2] || '—'}</td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={maxSingleHandTop3[0]} /></td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={maxSingleHandTop3[1]} /></td>
+                        <td className="py-1.5 sm:py-2"><RankCell text={maxSingleHandTop3[2]} /></td>
                       </tr>
                       <tr>
                         <td className="py-1.5 sm:py-2 pr-2 whitespace-nowrap">連莊王</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{consecutiveDealerTop3[0] || '—'}</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{consecutiveDealerTop3[1] || '—'}</td>
-                        <td className="py-1.5 sm:py-2">{consecutiveDealerTop3[2] || '—'}</td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={consecutiveDealerTop3[0]} /></td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={consecutiveDealerTop3[1]} /></td>
+                        <td className="py-1.5 sm:py-2"><RankCell text={consecutiveDealerTop3[2]} /></td>
                       </tr>
                       <tr>
                         <td className="py-1.5 sm:py-2 pr-2 whitespace-nowrap">自摸王</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{zimoTop3[0] || '—'}</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{zimoTop3[1] || '—'}</td>
-                        <td className="py-1.5 sm:py-2">{zimoTop3[2] || '—'}</td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={zimoTop3[0]} /></td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={zimoTop3[1]} /></td>
+                        <td className="py-1.5 sm:py-2"><RankCell text={zimoTop3[2]} /></td>
                       </tr>
                       <tr>
                         <td className="py-1.5 sm:py-2 pr-2 whitespace-nowrap">首席見證官</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{mostAttendanceTop3[0] || '—'}</td>
-                        <td className="py-1.5 sm:py-2 pr-2">{mostAttendanceTop3[1] || '—'}</td>
-                        <td className="py-1.5 sm:py-2">{mostAttendanceTop3[2] || '—'}</td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={mostAttendanceTop3[0]} /></td>
+                        <td className="py-1.5 sm:py-2 pr-2"><RankCell text={mostAttendanceTop3[1]} /></td>
+                        <td className="py-1.5 sm:py-2"><RankCell text={mostAttendanceTop3[2]} /></td>
                       </tr>
                     </tbody>
                   </table>
