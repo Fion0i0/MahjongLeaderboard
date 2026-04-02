@@ -13,6 +13,9 @@ export interface Round {
   fan: number;
   special: string;
   dealerStreak?: number;
+  isLeopard?: boolean;
+  // 七搶一 pre-settlement: 7-flower player receives from 1-flower player
+  sevenFlowers?: { winnerSeat: number; loserSeat: number };
   // Multi-winner fields (一炮雙響 / 一炮三響)
   winnerSeats?: number[];
   fans?: number[];

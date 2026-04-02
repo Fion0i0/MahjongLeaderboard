@@ -9,6 +9,7 @@ export const FAN_KEYWORDS: Record<string, number> = {
   碰發: 1,
   碰白: 1,
   卡窿: 1,
+  單吊: 1,
   中洞: 1,
   邊張: 1,
   搶槓: 1,
@@ -52,6 +53,7 @@ export function parseFanFromText(text: string): { items: FanBreakdownItem[]; tot
   let has門清 = false;
   let has自摸 = false;
   let has門清自摸 = false;
+  let hasLeopard = false;
   let diValue = 3; // default 底
 
   for (const token of tokens) {
@@ -85,6 +87,10 @@ export function parseFanFromText(text: string): { items: FanBreakdownItem[]; tot
       has自摸 = true;
       continue;
     }
+    if (token === '豹' || token === '豹子') {
+      hasLeopard = true;
+      continue;
+    }
 
     // Direct keyword lookup
     if (token in FAN_KEYWORDS) {
@@ -103,6 +109,10 @@ export function parseFanFromText(text: string): { items: FanBreakdownItem[]; tot
     if (has自摸) items.push({ label: '自摸', value: 1 });
   }
 
-  const total = items.reduce((sum, item) => sum + item.value, 0);
+  let total = items.reduce((sum, item) => sum + item.value, 0);
+  if (hasLeopard) {
+    items.push({ label: '豹', value: total });
+    total *= 2;
+  }
   return { items, total };
 }

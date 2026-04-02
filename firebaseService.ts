@@ -1,5 +1,5 @@
 import { initializeApp } from "firebase/app";
-import { getDatabase, ref, onValue, set, push, remove } from "firebase/database";
+import { getDatabase, ref, onValue, set, push, remove, get, update } from "firebase/database";
 import { getAuth, signInAnonymously } from "firebase/auth";
 import { Game, Round } from "./types";
 
@@ -102,6 +102,67 @@ export const loadDraftSession = (callback: (session: DraftSession | null) => voi
 
 export const clearDraftSession = async (): Promise<void> => {
   await remove(draftRef);
+};
+
+// One-time migration: replace old special hand names in all saved games
+export const migrateSpecialNames = async (replacements: Record<string, string>): Promise<number> => {
+  const snapshot = await get(gamesRef);
+  if (!snapshot.exists()) return 0;
+  const data = snapshot.val();
+  const updates: Record<string, any> = {};
+  let count = 0;
+
+  for (const gameKey of Object.keys(data)) {
+    const game = data[gameKey];
+    const rounds = game.rounds;
+    if (!rounds) continue;
+    const roundKeys = Object.keys(rounds);
+    for (const roundKey of roundKeys) {
+      const round = rounds[roundKey];
+      // Fix single-winner special
+      if (round.special && replacements[round.special]) {
+        updates[`games/${gameKey}/rounds/${roundKey}/special`] = replacements[round.special];
+        count++;
+      }
+      // Fix multi-winner specials array
+      if (round.specials) {
+        const specKeys = Object.keys(round.specials);
+        for (const sk of specKeys) {
+          if (replacements[round.specials[sk]]) {
+            updates[`games/${gameKey}/rounds/${roundKey}/specials/${sk}`] = replacements[round.specials[sk]];
+            count++;
+          }
+        }
+      }
+      // Fix player specials in players array
+    }
+    const players = game.players;
+    if (players) {
+      const playerKeys = Object.keys(players);
+      for (const pk of playerKeys) {
+        const p = players[pk];
+        if (p.special) {
+          let changed = false;
+          let newSpecial = p.special;
+          for (const [oldName, newName] of Object.entries(replacements)) {
+            if (newSpecial.includes(oldName)) {
+              newSpecial = newSpecial.split(oldName).join(newName);
+              changed = true;
+            }
+          }
+          if (changed) {
+            updates[`games/${gameKey}/players/${pk}/special`] = newSpecial;
+            count++;
+          }
+        }
+      }
+    }
+  }
+
+  if (Object.keys(updates).length > 0) {
+    await update(ref(database), updates);
+  }
+  return count;
 };
 
 export { database };

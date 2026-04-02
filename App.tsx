@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
 import { Game, Player, Round, PlayerYearlyStats, YearlyData, GeminiAnalysisResult } from './types';
-import { subscribeToGames, addGame, deleteGame as deleteGameFromDB, saveDraftSession, loadDraftSession, clearDraftSession, DraftSession, signInAnonymousUser } from './firebaseService';
+import { subscribeToGames, addGame, deleteGame as deleteGameFromDB, saveDraftSession, loadDraftSession, clearDraftSession, DraftSession, signInAnonymousUser, migrateSpecialNames } from './firebaseService';
 import { parseGameWithAI, analyzePerformanceWithAI } from './geminiService';
 import { VIPMember, loadVIPList } from './VIP/vipList';
 import { parseFanFromText } from './fanCalculator';
@@ -23,6 +23,11 @@ const DEALER_ROTATION = [3, 0, 1, 2]; // 東→南→西→北: next dealer by s
 const CROSS_GRID: (number | null)[] = [null, 0, null, 3, null, 1, null, 2, null];
 
 // ─── Helper Functions ───────────────────────────────────────────────────────────
+
+const generateId = (): string =>
+  typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
 
 function pickTopPlayers(
@@ -113,6 +118,22 @@ function pickTopConsecutiveDealer(games: Game[]): string[] {
   return ranked.slice(0, 3).map(([name, count]) => `${name} (連${count}莊)`);
 }
 
+function pickTopZimoPlayers(games: Game[]): string[] {
+  const zimoCounts = new Map<string, number>();
+  for (const game of games) {
+    for (const round of game.rounds) {
+      if (round.winType === 'zimo') {
+        const name = game.seats[round.winnerSeat];
+        zimoCounts.set(name, (zimoCounts.get(name) || 0) + 1);
+      }
+    }
+  }
+  const ranked = [...zimoCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  if (ranked.length === 0) return [];
+  return ranked.slice(0, 3).map(([name, count]) => `${name} (${count}次)`);
+}
+
 function computeYearlyData(games: Game[]): YearlyData[] {
   if (games.length === 0) return [];
 
@@ -185,7 +206,7 @@ function computeYearlyData(games: Game[]): YearlyData[] {
   });
 }
 
-function computeScoresFromRounds(seats: string[], rounds: Round[], baseRate: number): Player[] {
+function computeScoresFromRounds(seats: string[], rounds: Round[], baseRate: number, di: number): Player[] {
   const scores = [0, 0, 0, 0];
   const specials: string[][] = [[], [], [], []];
 
@@ -193,8 +214,17 @@ function computeScoresFromRounds(seats: string[], rounds: Round[], baseRate: num
   let dealerStreak = 0;
 
   for (const round of rounds) {
-    const amount = round.fan * baseRate;
-    const dealerExtra = (2 * dealerStreak + 1) * baseRate;
+    const leopardMul = round.isLeopard ? 2 : 1;
+    // payment = (底 + fan × baseRate) × leopardMul
+    const amount = (di + round.fan * baseRate) * leopardMul;
+    const dealerExtra = (2 * dealerStreak + 1) * baseRate * leopardMul;
+
+    // 七搶一 pre-settlement: 1-flower player pays 7-flower player
+    if (round.sevenFlowers) {
+      const sfAmount = (di + 8 * baseRate) * leopardMul;
+      scores[round.sevenFlowers.winnerSeat] += sfAmount;
+      scores[round.sevenFlowers.loserSeat] -= sfAmount;
+    }
 
     // Draw: no score change, dealer stays with 連莊
     if (round.winType === 'draw') { dealerStreak++; continue; }
@@ -203,25 +233,29 @@ function computeScoresFromRounds(seats: string[], rounds: Round[], baseRate: num
       ? round.winnerSeats : [round.winnerSeat];
 
     if (round.winType === 'zimo') {
-      // Non-dealer 自摸: dealer pays extra (2N+1); dealer 自摸: no extra
+      // 自摸: each loser pays 底 + fan×baseRate + dealer extra when dealer involved
       for (let i = 0; i < 4; i++) {
         if (i !== round.winnerSeat) {
-          const extra = (i === dealerSeat && round.winnerSeat !== dealerSeat) ? dealerExtra : 0;
+          // Dealer extra applies when dealer is winner OR dealer is one of the losers
+          const extra = (i === dealerSeat || round.winnerSeat === dealerSeat) ? dealerExtra : 0;
           scores[i] -= (amount + extra);
           scores[round.winnerSeat] += (amount + extra);
         }
       }
     } else if (round.loserSeat !== undefined) {
+      // Dealer extra when dealer is winner OR loser (出統)
+      const dealerInvolved = round.loserSeat === dealerSeat || winners.includes(dealerSeat);
+      const chutongDealerExtra = dealerInvolved ? dealerExtra : 0;
       if (winners.length > 1 && round.fans) {
-        // 一炮雙響 / 一炮三響: loser pays each winner their individual fan
+        // 一炮雙響 / 一炮三響: loser pays each winner
         for (let w = 0; w < winners.length; w++) {
-          const winnerAmount = round.fans[w] * baseRate;
+          const winnerAmount = (di + round.fans[w] * baseRate) * leopardMul + chutongDealerExtra;
           scores[winners[w]] += winnerAmount;
           scores[round.loserSeat] -= winnerAmount;
         }
       } else {
-        scores[round.winnerSeat] += amount;
-        scores[round.loserSeat] -= amount;
+        scores[round.winnerSeat] += amount + chutongDealerExtra;
+        scores[round.loserSeat] -= (amount + chutongDealerExtra);
       }
     }
 
@@ -371,6 +405,12 @@ export default function App() {
   const [fanCalcTexts, setFanCalcTexts] = useState<Map<number, string>>(new Map());
   const [editingRoundId, setEditingRoundId] = useState<string | null>(null);
   const [activeWinnerTab, setActiveWinnerTab] = useState<number | null>(null);
+  const [roundIsLeopard, setRoundIsLeopard] = useState(false);
+  const [sevenFlowersEnabled, setSevenFlowersEnabled] = useState(false);
+  const [sevenFlowersWinner, setSevenFlowersWinner] = useState<number | null>(null);
+  const [sevenFlowersLoser, setSevenFlowersLoser] = useState<number | null>(null);
+  const [showRoundModal, setShowRoundModal] = useState(false);
+  const [isMultiWinMode, setIsMultiWinMode] = useState(false);
 
   const resetRoundForm = () => {
     setRoundWinners([]);
@@ -381,6 +421,13 @@ export default function App() {
     setFanCalcTexts(new Map());
     setEditingRoundId(null);
     setActiveWinnerTab(null);
+    setRoundIsLeopard(false);
+    setSevenFlowersEnabled(false);
+    setSevenFlowersWinner(null);
+    setSevenFlowersLoser(null);
+    setShowRoundModal(false);
+
+    setIsMultiWinMode(false);
   };
 
   // AI mode
@@ -447,40 +494,72 @@ export default function App() {
   const roundTransfers = useMemo(() => {
     if (!gameSession) return [];
     const { rounds, baseRate } = gameSession;
+    const di = Number(gameSession.note) || 0;
     const result: number[][] = [];
     let ds = 0, dk = 0;
     for (const round of rounds) {
       const t = [0, 0, 0, 0];
+      const lm = round.isLeopard ? 2 : 1;
+      // 七搶一 pre-settlement
+      if (round.sevenFlowers) {
+        const sfAmt = (di + 8 * baseRate) * lm;
+        t[round.sevenFlowers.winnerSeat] += sfAmt;
+        t[round.sevenFlowers.loserSeat] -= sfAmt;
+      }
       if (round.winType === 'draw') { result.push(t); dk++; continue; }
       const winners = round.winnerSeats && round.winnerSeats.length > 1
         ? round.winnerSeats : [round.winnerSeat];
       if (round.winType === 'zimo') {
-        const amount = round.fan * baseRate;
-        const dealerExtra = (2 * dk + 1) * baseRate;
+        const amount = (di + round.fan * baseRate) * lm;
+        const dealerExtra = (2 * dk + 1) * baseRate * lm;
         for (let i = 0; i < 4; i++) {
           if (i !== round.winnerSeat) {
-            const extra = (i === ds && round.winnerSeat !== ds) ? dealerExtra : 0;
+            const extra = (i === ds || round.winnerSeat === ds) ? dealerExtra : 0;
             t[i] -= (amount + extra);
             t[round.winnerSeat] += (amount + extra);
           }
         }
       } else if (round.loserSeat !== undefined) {
+        const dealerExtra = (2 * dk + 1) * baseRate * lm;
+        const ctDealerExtra = (round.loserSeat === ds || winners.includes(ds)) ? dealerExtra : 0;
         if (winners.length > 1 && round.fans) {
           for (let w = 0; w < winners.length; w++) {
-            const winnerAmount = round.fans[w] * baseRate;
+            const winnerAmount = (di + round.fans[w] * baseRate) * lm + ctDealerExtra;
             t[winners[w]] += winnerAmount;
             t[round.loserSeat] -= winnerAmount;
           }
         } else {
-          const amount = round.fan * baseRate;
-          t[round.winnerSeat] += amount;
-          t[round.loserSeat] -= amount;
+          const amount = (di + round.fan * baseRate) * lm;
+          t[round.winnerSeat] += amount + ctDealerExtra;
+          t[round.loserSeat] -= (amount + ctDealerExtra);
         }
       }
       result.push(t);
       if (winners.includes(ds)) { dk++; } else { ds = DEALER_ROTATION[ds]; dk = 0; }
     }
     return result;
+  }, [gameSession]);
+
+  const windInfo = useMemo(() => {
+    const WINDS = ['東', '南', '西', '北'];
+    if (!gameSession) return { labels: [] as string[], current: '東東' };
+    const labels: string[] = [];
+    let ds = 0, dealerChanges = 0;
+    for (const round of gameSession.rounds) {
+      const circle = WINDS[Math.floor(dealerChanges / 4) % 4];
+      const pos = WINDS[dealerChanges % 4];
+      labels.push(`${circle}${pos}`);
+      if (round.winType === 'draw') continue;
+      const winners = round.winnerSeats && round.winnerSeats.length > 1
+        ? round.winnerSeats : [round.winnerSeat];
+      if (!winners.includes(ds)) {
+        ds = DEALER_ROTATION[ds];
+        dealerChanges++;
+      }
+    }
+    const circle = WINDS[Math.floor(dealerChanges / 4) % 4];
+    const pos = WINDS[dealerChanges % 4];
+    return { labels, current: `${circle}${pos}` };
   }, [gameSession]);
 
   // ─── Seat Assignment Handlers ─────────────────────────────────────────────
@@ -534,14 +613,24 @@ export default function App() {
       return;
     }
 
+    if (sevenFlowersEnabled && (sevenFlowersWinner === null || sevenFlowersLoser === null)) {
+      alert('七搶一: 請選擇 7花 同 1花 玩家.');
+      return;
+    }
+
+    const sevenFlowersData = sevenFlowersEnabled && sevenFlowersWinner !== null && sevenFlowersLoser !== null
+      ? { sevenFlowers: { winnerSeat: sevenFlowersWinner, loserSeat: sevenFlowersLoser } }
+      : {};
+
     // Draw: no winner/loser/fan needed
     if (roundWinType === 'draw') {
       const drawRound: Round = {
-        id: editingRoundId || crypto.randomUUID(),
+        id: editingRoundId || generateId(),
         winnerSeat: -1,
         winType: 'draw',
         fan: 0,
         special: '',
+        ...sevenFlowersData,
       };
       if (editingRoundId) {
         setGameSession((prev) =>
@@ -587,6 +676,8 @@ export default function App() {
         ...(roundWinType === 'chutong' ? { loserSeat: roundLoser! } : {}),
         fan: firstFan,
         special: firstSpecial,
+        ...(roundIsLeopard ? { isLeopard: true } : {}),
+        ...sevenFlowersData,
         ...(isMultiWinner ? {
           winnerSeats: [...roundWinners],
           fans: roundWinners.map(s => roundFans.get(s) ?? 3),
@@ -612,12 +703,14 @@ export default function App() {
       const newStreak = dealerAmongWinners ? gameSession!.dealerStreak + 1 : 0;
 
       const newRound: Round = {
-        id: crypto.randomUUID(),
+        id: generateId(),
         winnerSeat: firstWinner,
         winType: roundWinType,
         ...(roundWinType === 'chutong' ? { loserSeat: roundLoser! } : {}),
         fan: firstFan,
         special: firstSpecial,
+        ...(roundIsLeopard ? { isLeopard: true } : {}),
+        ...sevenFlowersData,
         ...(dealerAmongWinners ? { dealerStreak: newStreak } : {}),
         ...(isMultiWinner ? {
           winnerSeats: [...roundWinners],
@@ -644,9 +737,14 @@ export default function App() {
   };
 
   const editRound = (round: Round) => {
+    const gameDi = Number(gameSession!.note) || 0;
     setEditingRoundId(round.id);
     setRoundWinType(round.winType);
     setRoundLoser(round.loserSeat ?? null);
+    setRoundIsLeopard(round.isLeopard ?? false);
+    setSevenFlowersEnabled(!!round.sevenFlowers);
+    setSevenFlowersWinner(round.sevenFlowers?.winnerSeat ?? null);
+    setSevenFlowersLoser(round.sevenFlowers?.loserSeat ?? null);
 
     if (round.winType === 'draw') {
       setRoundWinners([]);
@@ -654,15 +752,17 @@ export default function App() {
       setRoundSpecials(new Map());
       setFanCalcTexts(new Map());
       setActiveWinnerTab(null);
+      setShowRoundModal(true);
       return;
     }
 
     if (round.winnerSeats && round.winnerSeats.length > 1) {
       setRoundWinners(round.winnerSeats);
+      setIsMultiWinMode(true);
       const fansMap = new Map<number, number>();
       const specialsMap = new Map<number, string>();
       round.winnerSeats.forEach((seat, idx) => {
-        fansMap.set(seat, round.fans?.[idx] ?? round.fan);
+        fansMap.set(seat, Math.max(0, (round.fans?.[idx] ?? round.fan) - gameDi));
         specialsMap.set(seat, round.specials?.[idx] ?? '');
       });
       setRoundFans(fansMap);
@@ -670,11 +770,13 @@ export default function App() {
       setActiveWinnerTab(round.winnerSeats[0]);
     } else {
       setRoundWinners([round.winnerSeat]);
-      setRoundFans(new Map([[round.winnerSeat, round.fan]]));
+      setIsMultiWinMode(false);
+      setRoundFans(new Map([[round.winnerSeat, Math.max(0, round.fan - gameDi)]]));
       setRoundSpecials(new Map([[round.winnerSeat, round.special]]));
       setActiveWinnerTab(round.winnerSeat);
     }
     setFanCalcTexts(new Map());
+    setShowRoundModal(true);
   };
 
   const deleteRound = (roundId: string) => {
@@ -700,7 +802,8 @@ export default function App() {
     const players = computeScoresFromRounds(
       gameSession.seats,
       gameSession.rounds,
-      gameSession.baseRate
+      gameSession.baseRate,
+      Number(gameSession.note) || 0
     );
 
     // Strip undefined values from rounds (Firebase rejects undefined)
@@ -709,7 +812,7 @@ export default function App() {
     );
 
     const game: Game = {
-      id: crypto.randomUUID(),
+      id: generateId(),
       date: gameSession.date,
       note: gameSession.note,
       baseRate: gameSession.baseRate,
@@ -778,7 +881,7 @@ export default function App() {
           special: p.special || '',
         }));
         const game: Game = {
-          id: crypto.randomUUID(),
+          id: generateId(),
           date: result.date || new Date().toISOString().split('T')[0],
           note: result.note || '',
           baseRate: 0,
@@ -822,6 +925,8 @@ export default function App() {
         if (next === '7749') {
           signInAnonymousUser().then(() => {
             setShowHome(false);
+            // One-time migration: rename old special hand names
+            migrateSpecialNames({ '七對子': '嚦咕嚦咕' });
           }).catch(() => {
             alert('Authentication failed. Please try again.');
             setPin('');
@@ -911,7 +1016,8 @@ export default function App() {
       const scores = computeScoresFromRounds(
         gameSession.seats,
         gameSession.rounds,
-        gameSession.baseRate
+        gameSession.baseRate,
+        Number(gameSession.note) || 0
       );
 
       return (
@@ -920,15 +1026,18 @@ export default function App() {
           <Card>
             <div className="flex items-center justify-between mb-3">
               <div>
-                <span className="text-sm text-[#3df2bc] font-semibold">{gameSession.date}</span>
+                <span className="text-sm font-semibold" style={{backgroundImage: 'linear-gradient(90deg, #ffadad, #ffd6a5, #fdffb6, #caffbf, #9bf6ff, #a0c4ff, #bdb2ff, #ffc6ff)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent'}}>{gameSession.date}</span>
                 <span className="text-xs text-[#707A8A] ml-2">${gameSession.baseRate}/台</span>
                 {gameSession.note && (
                   <span className="text-xs text-[#707A8A] ml-2">({gameSession.note})</span>
                 )}
               </div>
-              <Button variant="ghost" onClick={cancelGameSession} className="text-xs px-2 py-1">
-                <i className="fas fa-xmark mr-1" />Cancel
-              </Button>
+              <div className="flex items-center gap-2">
+                <span className="text-xs px-2 py-1 rounded bg-[#FFD700]/20 text-[#FFD700] font-bold">{windInfo.current}</span>
+                <Button variant="ghost" onClick={cancelGameSession} className="text-xs px-2 py-1">
+                  <i className="fas fa-xmark mr-1" />Cancel
+                </Button>
+              </div>
             </div>
 
             <div className="grid grid-cols-3 gap-1.5 sm:gap-2 max-w-[240px] sm:max-w-xs mx-auto place-items-center">
@@ -940,7 +1049,24 @@ export default function App() {
                 const vip = vipList.find((v) => v.name === name);
                 const score = scores[seatIdx]?.score || 0;
                 return (
-                  <div key={cellIdx} className="flex flex-col items-center text-center">
+                  <div
+                    key={cellIdx}
+                    className="flex flex-col items-center text-center cursor-pointer hover:opacity-80 transition-opacity"
+                    onClick={() => {
+                      // Open round modal with this player as winner
+                      setRoundWinners([seatIdx]);
+                      setRoundFans(new Map([[seatIdx, 3]]));
+                      setRoundSpecials(new Map([[seatIdx, '']]));
+                      setFanCalcTexts(new Map([[seatIdx, '']]));
+                      setActiveWinnerTab(seatIdx);
+                      setRoundWinType('chutong');
+                      setRoundLoser(null);
+                  
+                      setRoundIsLeopard(false);
+                      setIsMultiWinMode(false);
+                      setShowRoundModal(true);
+                    }}
+                  >
                     {vip?.image ? (
                       <img
                         src={vip.image}
@@ -979,290 +1105,345 @@ export default function App() {
             </div>
           </Card>
 
-          {/* Add round form */}
-          <Card>
-            <h3 className="text-sm font-semibold text-[#E0E6ED] mb-3">食胡未?</h3>
+          {/* Quick action buttons */}
+          <div className="flex gap-2">
+            <Button
+              onClick={() => {
+                setRoundWinType('draw');
+                setRoundWinners([]);
+                setRoundLoser(null);
+                setRoundFans(new Map());
+                setRoundSpecials(new Map());
+                setFanCalcTexts(new Map());
+                setActiveWinnerTab(null);
+                setRoundIsLeopard(false);
+                addRound();
+              }}
+              variant="secondary"
+              className="flex-1"
+            >
+              流局
+            </Button>
+            <Button
+              onClick={() => {
+                // Open modal for 自摸 — user picks winner from inside
+                setRoundWinType('zimo');
+                setRoundWinners([]);
+                setRoundLoser(null);
+                setRoundFans(new Map());
+                setRoundSpecials(new Map());
+            
+                setRoundIsLeopard(false);
+                setIsMultiWinMode(false);
+                setShowRoundModal(true);
+              }}
+              variant="secondary"
+              className="flex-1"
+            >
+              自摸
+            </Button>
+          </div>
+          <p className="text-center text-xs text-[#707A8A] mt-1">點擊玩家頭像 = 出統食胡</p>
 
-            {/* Win type */}
-            <div className="mb-3">
-              <label className="block text-xs text-[#707A8A] mb-1">點食先</label>
-              <div className="grid grid-cols-3 gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRoundWinType('chutong');
-                    setRoundLoser(null);
-                  }}
-                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                    roundWinType === 'chutong'
-                      ? 'bg-[#FF3131] text-white'
-                      : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
-                  }`}
-                >
-                  有人出統
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRoundWinType('zimo');
-                    setRoundLoser(null);
-                    // Trim to single winner if multiple selected
-                    if (roundWinners.length > 1) {
-                      const first = roundWinners[0];
-                      setRoundWinners([first]);
-                      setRoundFans(new Map([[first, roundFans.get(first) ?? 3]]));
-                      setRoundSpecials(new Map([[first, roundSpecials.get(first) ?? '']]));
-                      setFanCalcTexts(new Map([[first, fanCalcTexts.get(first) ?? '']]));
-                      setActiveWinnerTab(first);
-                    }
-                  }}
-                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                    roundWinType === 'zimo'
-                      ? 'bg-[#FFD700] text-[#0B0E14]'
-                      : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
-                  }`}
-                >
-                  又自摸 !!!
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRoundWinType('draw');
-                    setRoundLoser(null);
-                    setRoundWinners([]);
-                    setRoundFans(new Map());
-                    setRoundSpecials(new Map());
-                    setFanCalcTexts(new Map());
-                    setActiveWinnerTab(null);
-                  }}
-                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                    roundWinType === 'draw'
-                      ? 'bg-[#707A8A] text-white'
-                      : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
-                  }`}
-                >
-                  流局
-                </button>
-              </div>
-            </div>
+          {/* ─── Round Modal Popup ─── */}
+          {showRoundModal && gameSession && (() => {
+            const currentFan = activeWinnerTab !== null ? (roundFans.get(activeWinnerTab) ?? 3) : 3;
+            const gameDi = Number(gameSession.note) || 0;
+            const isChutongDealerInvolved = roundWinType === 'chutong' && (roundLoser === gameSession.dealerSeat || roundWinners.includes(gameSession.dealerSeat));
+            const isZimoDealerInvolved = roundWinType === 'zimo' && roundWinners.length > 0;
+            const dealerBonus = (isChutongDealerInvolved || isZimoDealerInvolved)
+              ? (2 * gameSession.dealerStreak + 1) * gameSession.baseRate
+              : 0;
+            const rawTotal = gameDi + currentFan * gameSession.baseRate + dealerBonus;
+            const total = roundIsLeopard ? rawTotal * 2 : rawTotal;
+            const nonWinners = [0, 1, 2, 3].filter(i => !roundWinners.includes(i));
 
-            {/* Winner / Loser / Fan sections (hidden for draw) */}
-            {roundWinType !== 'draw' && (<>
-            <div className="mb-3">
-              <label className="block text-xs text-[#707A8A] mb-1">
-                邊個又食胡
-                {roundWinType === 'chutong' && roundWinners.length === 2 && (
-                  <span className="text-[#FFD700] ml-2">一炮雙響</span>
-                )}
-                {roundWinType === 'chutong' && roundWinners.length === 3 && (
-                  <span className="text-[#FFD700] ml-2">一炮三響</span>
-                )}
-              </label>
-              <div className="grid grid-cols-4 gap-2">
-                {gameSession.seats.map((name, i) => (
-                  <button
-                    key={i}
-                    type="button"
-                    onClick={() => {
-                      if (roundWinType === 'chutong') {
-                        // Multi-select mode for chutong
-                        setRoundWinners(prev => {
-                          if (prev.includes(i)) {
-                            const next = prev.filter(w => w !== i);
-                            setRoundFans(m => { const n = new Map(m); n.delete(i); return n; });
-                            setRoundSpecials(m => { const n = new Map(m); n.delete(i); return n; });
-                            setFanCalcTexts(m => { const n = new Map(m); n.delete(i); return n; });
-                            if (activeWinnerTab === i) setActiveWinnerTab(next[0] ?? null);
-                            return next;
-                          } else if (prev.length < 3) {
-                            setRoundFans(m => new Map(m).set(i, 3));
-                            setRoundSpecials(m => new Map(m).set(i, ''));
-                            setFanCalcTexts(m => new Map(m).set(i, ''));
-                            setActiveWinnerTab(i);
-                            if (roundLoser === i) setRoundLoser(null);
-                            return [...prev, i];
-                          }
-                          return prev;
-                        });
-                      } else {
-                        // Single-select mode for zimo or no type yet
-                        if (roundWinners.includes(i) && roundWinners.length === 1) {
-                          setRoundWinners([]);
-                          setRoundFans(new Map());
-                          setRoundSpecials(new Map());
-                          setFanCalcTexts(new Map());
-                          setActiveWinnerTab(null);
-                        } else {
-                          setRoundWinners([i]);
-                          setRoundFans(new Map([[i, 3]]));
-                          setRoundSpecials(new Map([[i, '']]));
-                          setFanCalcTexts(new Map([[i, '']]));
-                          setActiveWinnerTab(i);
-                          if (roundLoser === i) setRoundLoser(null);
-                        }
-                      }
-                    }}
-                    className={`px-2 py-2 rounded-lg text-xs font-medium text-center transition-all ${
-                      roundWinners.includes(i)
-                        ? 'bg-[#3df2bc] text-[#0B0E14]'
-                        : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] hover:border-[#3df2bc]'
-                    }`}
-                  >
-                    {name}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Loser (if chutong) */}
-            {roundWinType === 'chutong' && (() => {
-              const nonWinners = [0, 1, 2, 3].filter(i => !roundWinners.includes(i));
-              // Auto-select loser when only 1 non-winner remains (一炮三響)
-              if (nonWinners.length === 1 && roundLoser !== nonWinners[0]) {
-                setTimeout(() => setRoundLoser(nonWinners[0]), 0);
-              }
-              return (
-                <div className="mb-3">
-                  <label className="block text-xs text-[#707A8A] mb-1">邊個又出統</label>
-                  {nonWinners.length === 1 ? (
-                    <div className="text-sm text-[#FF3131] font-medium px-3 py-2 bg-[#FF3131]/10 rounded-lg">
-                      {gameSession.seats[nonWinners[0]]}
-                    </div>
-                  ) : (
-                    <div className={`grid grid-cols-${nonWinners.length} gap-2`}>
-                      {nonWinners.map(i => (
+            return (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4" onClick={() => resetRoundForm()}>
+                <div className="bg-[#1A1D24] rounded-2xl w-full max-w-md max-h-[90vh] overflow-y-auto shadow-2xl border border-[#2A2D33]" onClick={(e) => e.stopPropagation()}>
+                  {/* Header */}
+                  <div className="flex items-center justify-between px-4 py-3 border-b border-[#2A2D33]">
+                    <h3 className="text-sm font-semibold text-[#E0E6ED]">
+                      {roundWinType === 'zimo' ? '自摸' : '食胡未?'}
+                      {isMultiWinMode && <span className="text-[#FFD700] ml-2">一炮多響</span>}
+                    </h3>
+                    <div className="flex items-center gap-2">
+                      {roundWinType === 'chutong' && (
                         <button
-                          key={i}
                           type="button"
-                          onClick={() => setRoundLoser(i)}
-                          className={`px-2 py-2 rounded-lg text-xs font-medium text-center transition-all ${
-                            roundLoser === i
-                              ? 'bg-[#FF3131] text-white'
-                              : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] hover:border-[#FF3131]'
+                          onClick={() => setIsMultiWinMode(!isMultiWinMode)}
+                          className={`px-2 py-1 rounded-lg text-xs font-medium transition-all ${
+                            isMultiWinMode
+                              ? 'bg-[#FFD700] text-[#0B0E14]'
+                              : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
                           }`}
                         >
-                          {gameSession.seats[i]}
+                          一炮多響
                         </button>
-                      ))}
+                      )}
+                      <button onClick={() => resetRoundForm()} className="text-[#707A8A] hover:text-[#E0E6ED]">
+                        <i className="fas fa-xmark text-lg" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Winner icons (for multi-win or zimo selection) */}
+                  {roundWinType === 'zimo' && roundWinners.length === 0 && (
+                    <div className="px-4 py-3 border-b border-[#2A2D33]">
+                      <label className="block text-xs text-[#707A8A] mb-2">邊個自摸?</label>
+                      <div className="grid grid-cols-4 gap-2">
+                        {gameSession.seats.map((name, i) => (
+                          <button key={i} type="button"
+                            onClick={() => {
+                              setRoundWinners([i]);
+                              setRoundFans(new Map([[i, 3]]));
+                              setRoundSpecials(new Map([[i, '']]));
+                              setFanCalcTexts(new Map([[i, '']]));
+                              setActiveWinnerTab(i);
+                            }}
+                            className="px-2 py-2 rounded-lg text-xs font-medium bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] hover:border-[#FFD700]"
+                          >{name}</button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Multi-winner tabs */}
+                  {isMultiWinMode && roundWinners.length > 0 && (
+                    <div className="px-4 py-2 border-b border-[#2A2D33]">
+                      <div className="flex items-center gap-2">
+                        {roundWinners.map((seat, wIdx) => (
+                          <button key={seat} type="button"
+                            onClick={() => setActiveWinnerTab(seat)}
+                            className={`flex-1 px-2 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                              activeWinnerTab === seat
+                                ? 'bg-[#3df2bc] text-[#0B0E14]'
+                                : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
+                            }`}
+                          >
+                            {gameSession.seats[seat]} ({roundFans.get(seat) ?? 3}台)
+                          </button>
+                        ))}
+                        {roundWinners.length < 3 && (
+                          <button type="button"
+                            onClick={() => {
+                              // Pick next available non-winner
+                              const available = [0,1,2,3].filter(i => !roundWinners.includes(i) && i !== roundLoser);
+                              if (available.length > 0) {
+                                const next = available[0];
+                                setRoundWinners(prev => [...prev, next]);
+                                setRoundFans(m => new Map(m).set(next, 3));
+                                setRoundSpecials(m => new Map(m).set(next, ''));
+                                setFanCalcTexts(m => new Map(m).set(next, ''));
+                                setActiveWinnerTab(next);
+                              }
+                            }}
+                            className="px-2 py-1.5 rounded-lg text-xs font-medium bg-[#0B0E14] text-[#3df2bc] border border-[#3df2bc]/30 hover:border-[#3df2bc]"
+                          >
+                            <i className="fas fa-plus" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Winner display (single) */}
+                  {!isMultiWinMode && roundWinners.length > 0 && (
+                    <div className="px-4 py-2 border-b border-[#2A2D33] flex items-center gap-2">
+                      <span className="text-xs text-[#707A8A]">贏家:</span>
+                      <span className="text-sm font-bold text-[#3df2bc]">{gameSession.seats[roundWinners[0]]}</span>
+                    </div>
+                  )}
+
+                  {/* Main content: Fan picker (left) + Loser selector (right) */}
+                  {roundWinners.length > 0 && activeWinnerTab !== null && (
+                    <div className="px-4 py-3">
+                      {/* Win type toggle */}
+                      <div className="flex gap-2 mb-3">
+                        <button type="button"
+                          onClick={() => { setRoundWinType('chutong'); setRoundLoser(null); }}
+                          className={`flex-1 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                            roundWinType === 'chutong' ? 'bg-[#FF3131] text-white' : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
+                          }`}
+                        >出統</button>
+                        <button type="button"
+                          onClick={() => {
+                            setRoundWinType('zimo');
+                            setRoundLoser(null);
+                            if (roundWinners.length > 1) {
+                              const first = roundWinners[0];
+                              setRoundWinners([first]);
+                              setRoundFans(new Map([[first, roundFans.get(first) ?? 3]]));
+                              setRoundSpecials(new Map([[first, roundSpecials.get(first) ?? '']]));
+                              setActiveWinnerTab(first);
+                              setIsMultiWinMode(false);
+                            }
+                          }}
+                          className={`flex-1 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                            roundWinType === 'zimo' ? 'bg-[#FFD700] text-[#0B0E14]' : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
+                          }`}
+                        >自摸</button>
+                      </div>
+
+                      <div className="flex gap-3">
+                        {/* Left: Fan rolling number picker */}
+                        <div className="flex-1">
+                          <label className="block text-xs text-[#707A8A] mb-1">
+                            {isMultiWinMode ? `${gameSession.seats[activeWinnerTab]} 台數` : '台數'}
+                          </label>
+                          <div className="h-[180px] overflow-y-auto rounded-lg border border-[#2A2D33] bg-[#0B0E14] scroll-smooth snap-y snap-mandatory">
+                            {Array.from({ length: 13 }, (_, i) => i + 1).map(n => (
+                              <button key={n} type="button"
+                                onClick={() => setRoundFans(m => new Map(m).set(activeWinnerTab!, n))}
+                                className={`w-full py-2.5 text-center text-sm font-medium snap-center transition-all ${
+                                  (roundFans.get(activeWinnerTab) ?? 3) === n
+                                    ? 'bg-[#3df2bc] text-[#0B0E14]'
+                                    : 'text-[#E0E6ED] hover:bg-[#2A2D33]'
+                                }`}
+                              >{n}</button>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Right: Loser selector (chutong) or info (zimo) */}
+                        <div className="flex-1">
+                          {roundWinType === 'chutong' ? (
+                            <>
+                              <label className="block text-xs text-[#707A8A] mb-1">邊個又出統</label>
+                              <div className="space-y-1.5">
+                                {nonWinners.map(i => (
+                                  <button key={i} type="button"
+                                    onClick={() => setRoundLoser(i)}
+                                    className={`w-full px-3 py-2.5 rounded-lg text-sm font-medium text-left transition-all ${
+                                      roundLoser === i
+                                        ? 'bg-[#FF3131] text-white'
+                                        : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] hover:border-[#FF3131]'
+                                    }`}
+                                  >{gameSession.seats[i]}</button>
+                                ))}
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              <label className="block text-xs text-[#707A8A] mb-1">食咩大牌</label>
+                              <SpecialHandPicker
+                                value={roundSpecials.get(activeWinnerTab) ?? ''}
+                                onChange={(val) => setRoundSpecials(m => new Map(m).set(activeWinnerTab!, val))}
+                              />
+                            </>
+                          )}
+
+                          {roundWinType === 'chutong' && (
+                            <div className="mt-2">
+                              <label className="block text-xs text-[#707A8A] mb-1">食咩大牌</label>
+                              <SpecialHandPicker
+                                value={roundSpecials.get(activeWinnerTab) ?? ''}
+                                onChange={(val) => setRoundSpecials(m => new Map(m).set(activeWinnerTab!, val))}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* 豹子 toggle */}
+                      <div className="mt-3">
+                        <button type="button"
+                          onClick={() => setRoundIsLeopard(!roundIsLeopard)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                            roundIsLeopard ? 'bg-[#FF6B35] text-white' : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
+                          }`}
+                        >🎲 豹子</button>
+                      </div>
+
+                      {/* Formula breakdown */}
+                      <div className="mt-2 bg-[#0B0E14] rounded-lg border border-[#2A2D33] overflow-hidden">
+                        <div className="text-xs text-[#707A8A] px-2 py-1.5">
+                          台: {currentFan}{dealerBonus > 0 ? ', 連莊' : ''}{roundIsLeopard ? ', 豹子' : ''}
+                        </div>
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="border-t border-[#2A2D33]">
+                              <th className="px-2 py-1 text-[#707A8A] font-medium text-center">底</th>
+                              <th className="px-2 py-1 text-[#707A8A] font-medium text-center">台</th>
+                              <th className="px-2 py-1 text-[#707A8A] font-medium text-center">莊</th>
+                              <th className="px-2 py-1 text-[#707A8A] font-medium text-center">豹</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr className="border-t border-[#2A2D33]">
+                              <td className="px-2 py-1.5 text-[#E0E6ED] text-center font-medium">{gameDi}</td>
+                              <td className="px-2 py-1.5 text-[#E0E6ED] text-center font-medium">{currentFan * gameSession.baseRate}</td>
+                              <td className="px-2 py-1.5 text-[#E0E6ED] text-center font-medium">{dealerBonus || 0}</td>
+                              <td className="px-2 py-1.5 text-center font-medium">
+                                {roundIsLeopard
+                                  ? <span className="text-[#FF6B35]">x2</span>
+                                  : <span className="text-[#707A8A]">-</span>
+                                }
+                              </td>
+                            </tr>
+                          </tbody>
+                        </table>
+                        <div className="border-t border-[#2A2D33] px-2 py-2 flex justify-end items-center gap-2">
+                          <span className="text-xs text-[#707A8A]">Total</span>
+                          <span className="text-xl font-bold text-[#3df2bc]">{total}</span>
+                        </div>
+                      </div>
+
+                      {/* 七搶一 */}
+                      <div className="mt-3 border-t border-[#2A2D33] pt-3">
+                        <button type="button"
+                          onClick={() => {
+                            setSevenFlowersEnabled(!sevenFlowersEnabled);
+                            if (sevenFlowersEnabled) { setSevenFlowersWinner(null); setSevenFlowersLoser(null); }
+                          }}
+                          className={`px-2 py-1 rounded-lg text-xs font-medium transition-all ${
+                            sevenFlowersEnabled ? 'bg-[#E91E63] text-white' : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
+                          }`}
+                        >🌸 七搶一</button>
+                        {sevenFlowersEnabled && (
+                          <div className="mt-2 grid grid-cols-2 gap-2">
+                            <div>
+                              <label className="block text-xs text-[#707A8A] mb-1">7花</label>
+                              <div className="flex flex-col gap-1">
+                                {gameSession.seats.map((name, si) => (
+                                  <button key={si} type="button"
+                                    onClick={() => setSevenFlowersWinner(sevenFlowersWinner === si ? null : si)}
+                                    className={`px-2 py-1 rounded text-xs ${sevenFlowersWinner === si ? 'bg-[#E91E63] text-white' : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'}`}
+                                  >{name}</button>
+                                ))}
+                              </div>
+                            </div>
+                            <div>
+                              <label className="block text-xs text-[#707A8A] mb-1">1花</label>
+                              <div className="flex flex-col gap-1">
+                                {gameSession.seats.map((name, si) => (
+                                  <button key={si} type="button"
+                                    onClick={() => setSevenFlowersLoser(sevenFlowersLoser === si ? null : si)}
+                                    disabled={si === sevenFlowersWinner}
+                                    className={`px-2 py-1 rounded text-xs ${sevenFlowersLoser === si ? 'bg-[#FF8787] text-white' : si === sevenFlowersWinner ? 'bg-[#0B0E14] text-[#2A2D33] cursor-not-allowed' : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'}`}
+                                  >{name}</button>
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Submit */}
+                  {roundWinners.length > 0 && (
+                    <div className="px-4 py-3 border-t border-[#2A2D33]">
+                      <Button onClick={addRound} className="w-full">
+                        <i className="fas fa-plus mr-2" />
+                        下局更好
+                      </Button>
                     </div>
                   )}
                 </div>
-              );
-            })()}
-
-            {/* Winner tabs for multi-winner */}
-            {roundWinners.length > 1 && (
-              <div className="mb-2">
-                <label className="block text-xs text-[#707A8A] mb-1">
-                  {roundWinners.length === 2 ? '一炮雙響' : '一炮三響'} — 每人台數
-                </label>
-                <div className="flex gap-2">
-                  {roundWinners.map(seat => (
-                    <button
-                      key={seat}
-                      type="button"
-                      onClick={() => setActiveWinnerTab(seat)}
-                      className={`flex-1 px-2 py-1.5 rounded-lg text-xs font-medium transition-all ${
-                        activeWinnerTab === seat
-                          ? 'bg-[#3df2bc] text-[#0B0E14]'
-                          : 'bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33]'
-                      }`}
-                    >
-                      {gameSession.seats[seat]}
-                      <span className="ml-1 opacity-70">({roundFans.get(seat) ?? 3}台)</span>
-                    </button>
-                  ))}
-                </div>
               </div>
-            )}
-
-            {/* Fan + Special (per active winner tab) */}
-            {activeWinnerTab !== null && (
-              <>
-                <div className="grid grid-cols-2 gap-2 sm:gap-3 mb-3">
-                  <div>
-                    <label className="block text-xs text-[#707A8A] mb-1">
-                      {roundWinners.length > 1 ? `${gameSession.seats[activeWinnerTab]} 台數` : '台數'}
-                    </label>
-                    <TableInput
-                      type="number"
-                      min={1}
-                      value={roundFans.get(activeWinnerTab) ?? 3}
-                      onChange={(e) => {
-                        const val = Number(e.target.value);
-                        setRoundFans(m => new Map(m).set(activeWinnerTab!, val));
-                      }}
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-[#707A8A] mb-1">食咩大牌</label>
-                    <SpecialHandPicker
-                      value={roundSpecials.get(activeWinnerTab) ?? ''}
-                      onChange={(val) => setRoundSpecials(m => new Map(m).set(activeWinnerTab!, val))}
-                    />
-                  </div>
-                </div>
-
-                {/* Fan Calculator */}
-                <div className="mb-3">
-                  <label className="block text-xs text-[#707A8A] mb-1">
-                    台數助手 <span className="text-[#3df2bc]">— 人工智障自動計算</span>
-                  </label>
-                  <input
-                    type="text"
-                    value={fanCalcTexts.get(activeWinnerTab) ?? ''}
-                    onChange={(e) => {
-                      const text = e.target.value;
-                      const tab = activeWinnerTab!;
-                      setFanCalcTexts(m => new Map(m).set(tab, text));
-                      if (text.trim()) {
-                        const result = parseFanFromText(text);
-                        if (result.total > 0) setRoundFans(m => new Map(m).set(tab, result.total));
-                      }
-                    }}
-                    placeholder="例: 莊家、連2、正花、碰中"
-                    className="w-full bg-[#0B0E14] text-[#E0E6ED] border border-[#2A2D33] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#3df2bc] placeholder-[#707A8A]"
-                  />
-                  {(fanCalcTexts.get(activeWinnerTab) ?? '').trim() && (() => {
-                    const result = parseFanFromText(fanCalcTexts.get(activeWinnerTab) ?? '');
-                    if (result.items.length === 0) return null;
-                    return (
-                      <div className="mt-1.5 bg-[#0B0E14] rounded-lg px-3 py-2 border border-[#2A2D33]">
-                        <div className="text-xs text-[#707A8A]">
-                          {result.items.map((item, idx) => (
-                            <span key={idx}>
-                              {idx > 0 && <span className="text-[#2A2D33] mx-1">+</span>}
-                              <span className="text-[#E0E6ED]">{item.label}</span>
-                              <span className="text-[#707A8A]">({item.value})</span>
-                            </span>
-                          ))}
-                          <span className="text-[#2A2D33] mx-1">=</span>
-                          <span className="text-[#3df2bc] font-bold">{result.total}台</span>
-                        </div>
-                      </div>
-                    );
-                  })()}
-                </div>
-              </>
-            )}
-            </>)}
-
-            <div className="flex gap-2">
-              {editingRoundId && (
-                <Button
-                  variant="secondary"
-                  onClick={() => resetRoundForm()}
-                  className="px-4"
-                >
-                  取消
-                </Button>
-              )}
-              <Button onClick={addRound} className="flex-1">
-                <i className={`fas ${editingRoundId ? 'fa-check' : 'fa-plus'} mr-2`} />
-                {editingRoundId ? '更新' : '下局會更好'}
-              </Button>
-            </div>
-          </Card>
+            );
+          })()}
 
           {/* Round history */}
           {gameSession.rounds.length > 0 && (
@@ -1282,6 +1463,15 @@ export default function App() {
                       <div className="flex items-center justify-between">
                         <div className="flex-1 text-sm">
                           <span className="text-[#707A8A]">#{idx + 1}</span>
+                          <span className="text-[#707A8A] ml-1">{windInfo.labels[idx]}</span>
+                          {round.isLeopard && (
+                            <span className="ml-1 text-xs px-1.5 py-0.5 rounded bg-[#FF6B35]/20 text-[#FF6B35]">🎲豹</span>
+                          )}
+                          {round.sevenFlowers && (
+                            <span className="ml-1 text-xs px-1.5 py-0.5 rounded bg-[#E91E63]/20 text-[#E91E63]">
+                              🌸七搶一 {gameSession.seats[round.sevenFlowers.winnerSeat]} ← {gameSession.seats[round.sevenFlowers.loserSeat]}
+                            </span>
+                          )}
                           {round.winType === 'draw' ? (
                             <span className="text-[#707A8A] font-medium ml-2">流局</span>
                           ) : isMultiWinner ? (
@@ -1289,37 +1479,32 @@ export default function App() {
                               <span className="text-[#FFD700] font-medium ml-2">
                                 {round.winnerSeats!.length === 2 ? '一炮雙響' : '一炮三響'}
                               </span>
-                              <span className="ml-1 text-xs px-1.5 py-0.5 rounded bg-[#FF3131]/20 text-[#FF3131]">
-                                出統
+                              <span className="text-[#87DD87] ml-1">
+                                {round.winnerSeats!.map(s => gameSession.seats[s]).join('|')}
                               </span>
                               {round.loserSeat !== undefined && (
-                                <span className="text-[#FF3131] text-xs ml-1">
-                                  ← {gameSession.seats[round.loserSeat]}
+                                <span className="text-[#E0E6ED] text-xs ml-1">
+                                  食 <span className="text-[#FF8787]">{gameSession.seats[round.loserSeat]}</span>
                                 </span>
                               )}
                             </>
                           ) : (
                             <>
-                              <span className="text-[#3df2bc] font-medium ml-2">
+                              <span className="text-[#87DD87] font-medium ml-2">
                                 {gameSession.seats[round.winnerSeat]}
                               </span>
-                              <span
-                                className={`ml-1 text-xs px-1.5 py-0.5 rounded ${
-                                  round.winType === 'zimo'
-                                    ? 'bg-[#FFD700]/20 text-[#FFD700]'
-                                    : 'bg-[#FF3131]/20 text-[#FF3131]'
-                                }`}
-                              >
-                                {round.winType === 'zimo' ? '自摸' : '出統'}
-                              </span>
-                              {round.winType === 'chutong' && round.loserSeat !== undefined && (
-                                <span className="text-[#FF3131] text-xs ml-1">
-                                  ← {gameSession.seats[round.loserSeat]}
+                              {round.winType === 'zimo' ? (
+                                <span className="ml-1 text-xs px-1.5 py-0.5 rounded bg-[#FFD700]/20 text-[#FFD700]">
+                                  自摸
                                 </span>
-                              )}
-                              <span className="text-[#E0E6ED] ml-2">{round.fan}台</span>
-                              {round.special && (
-                                <span className="text-[#FFD700] text-xs ml-2">{round.special}</span>
+                              ) : (
+                                <>
+                                  {round.loserSeat !== undefined && (
+                                    <span className="text-[#E0E6ED] text-xs ml-1">
+                                      食 <span className="text-[#FF8787]">{gameSession.seats[round.loserSeat]}</span>
+                                    </span>
+                                  )}
+                                </>
                               )}
                             </>
                           )}
@@ -1327,44 +1512,45 @@ export default function App() {
                         <div className="flex items-center gap-1">
                           <button
                             onClick={() => editRound(round)}
-                            className={`transition-colors px-2 ${editingRoundId === round.id ? 'text-[#3df2bc]' : 'text-[#707A8A] hover:text-[#3df2bc]'}`}
+                            className={`transition-colors px-2 ${editingRoundId === round.id ? 'text-[#87DD87]' : 'text-[#707A8A] hover:text-[#87DD87]'}`}
                           >
                             <i className="fas fa-pen text-xs" />
                           </button>
                           <button
                             onClick={() => deleteRound(round.id)}
-                            className="text-[#707A8A] hover:text-[#FF3131] transition-colors px-2"
+                            className="text-[#707A8A] hover:text-[#FF8787] transition-colors px-2"
                           >
                             <i className="fas fa-xmark text-xs" />
                           </button>
                         </div>
                       </div>
-                      {isMultiWinner && (
-                        <div className="mt-1 text-xs">
-                          {round.winnerSeats!.map((seat, wIdx) => (
-                            <span key={seat}>
-                              {wIdx > 0 && <span className="text-[#2A2D33] mx-1">|</span>}
-                              <span className="text-[#3df2bc]">{gameSession.seats[seat]}</span>
-                              <span className="text-[#E0E6ED] ml-1">{round.fans?.[wIdx] ?? round.fan}台</span>
-                              {round.specials?.[wIdx] && (
-                                <span className="text-[#FFD700] ml-1">{round.specials[wIdx]}</span>
-                              )}
-                            </span>
-                          ))}
-                        </div>
-                      )}
                       {roundTransfers[idx] && (
                         <div className="flex gap-3 mt-1 text-xs">
                           {gameSession.seats.map((name, i) => {
                             const val = roundTransfers[idx][i];
                             return (
-                              <span key={i} className={val > 0 ? 'text-[#3df2bc]' : val < 0 ? 'text-[#FF3131]' : 'text-[#707A8A]'}>
+                              <span key={i} className={val > 0 ? 'text-[#87DD87]' : val < 0 ? 'text-[#FF8787]' : 'text-[#707A8A]'}>
                                 {name} {val > 0 ? '+' : ''}{val}
                               </span>
                             );
                           })}
                         </div>
                       )}
+                      {(() => {
+                        const specials: string[] = [];
+                        if (isMultiWinner && round.specials) {
+                          round.winnerSeats!.forEach((seat, idx) => {
+                            if (round.specials![idx]) specials.push(round.specials![idx]);
+                          });
+                        } else if (round.special) {
+                          specials.push(round.special);
+                        }
+                        return specials.length > 0 ? (
+                          <div className="mt-1 text-xs text-[#FFD700]">
+                            <i className="fas fa-star mr-1" />{specials.join(', ')}
+                          </div>
+                        ) : null;
+                      })()}
                     </div>
                   );
                 })}
@@ -1409,7 +1595,7 @@ export default function App() {
                 placeholder={
                   "e.g. 1月15日 Alan 500, Bob -200, Charlie 300, David -600, Alan打咗大三元\n\nor: Jan 15 game, Alan won 500, Bob lost 200..."
                 }
-                className="w-full bg-[#0B0E14] border border-[#2A2D33] rounded-lg px-3 py-3 text-[#E0E6ED] placeholder-[#707A8A] focus:outline-none focus:border-[#3df2bc] transition-all min-h-[120px] resize-none"
+                className="w-full bg-[#0B0E14] border border-[#2A2D33] rounded-lg px-3 py-3 text-[#E0E6ED] placeholder-[#707A8A] focus:outline-none focus:border-[#87DD87] transition-all min-h-[120px] resize-none"
               />
               <Button
                 onClick={handleAiParse}
@@ -1482,7 +1668,7 @@ export default function App() {
                           {seatAssignments[seatIdx] && (
                             <button
                               onClick={() => clearSeat(seatIdx)}
-                              className="absolute right-0 text-[#707A8A] hover:text-[#FF3131] transition-colors"
+                              className="absolute right-0 text-[#707A8A] hover:text-[#FF8787] transition-colors"
                             >
                               <i className="fas fa-xmark text-xs" />
                             </button>
@@ -1556,7 +1742,7 @@ export default function App() {
                                 onClick={() => {
                                   if (customName.trim()) assignSeat(seatIdx, customName.trim());
                                 }}
-                                className="text-[#3df2bc] px-2 hover:bg-[#2A2D33] rounded-lg transition-colors"
+                                className="text-[#87DD87] px-2 hover:bg-[#2A2D33] rounded-lg transition-colors"
                               >
                                 <i className="fas fa-check text-xs" />
                               </button>
@@ -1569,7 +1755,7 @@ export default function App() {
                               setSelectingSeat(seatIdx);
                               setCustomName('');
                             }}
-                            className="w-full py-2 text-sm text-[#707A8A] hover:text-[#3df2bc] transition-colors"
+                            className="w-full py-2 text-sm text-[#707A8A] hover:text-[#87DD87] transition-colors"
                           >
                             <i className="fas fa-plus mr-1" />
                             參賽者
@@ -1623,15 +1809,10 @@ export default function App() {
             <Card key={game.id} className="space-y-2">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <span className="text-sm font-semibold text-[#3df2bc]">{game.date}</span>
+                  <span className="text-sm font-semibold" style={{backgroundImage: 'linear-gradient(90deg, #ffadad, #ffd6a5, #fdffb6, #caffbf, #9bf6ff, #a0c4ff, #bdb2ff, #ffc6ff)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent'}}>{game.date}</span>
                   {game.note && (
                     <span className="text-xs text-[#707A8A] bg-[#0B0E14] px-2 py-0.5 rounded-full">
-                      {game.note}
-                    </span>
-                  )}
-                  {roundCount > 0 && (
-                    <span className="text-xs text-[#707A8A] bg-[#0B0E14] px-2 py-0.5 rounded-full">
-                      {roundCount} rounds
+                      底:{game.note}
                     </span>
                   )}
                   {game.baseRate > 0 && (
@@ -1639,18 +1820,23 @@ export default function App() {
                       ${game.baseRate}/台
                     </span>
                   )}
+                  {roundCount > 0 && (
+                    <span className="text-xs text-[#707A8A] bg-[#0B0E14] px-2 py-0.5 rounded-full">
+                      {roundCount} rounds
+                    </span>
+                  )}                  
                 </div>
                 <div className="flex items-center gap-1">
                   <button
                     onClick={() => resumeGame(game)}
-                    className="text-[#707A8A] hover:text-[#3df2bc] transition-colors px-2 py-1"
+                    className="text-[#707A8A] hover:text-[#87DD87] transition-colors px-2 py-1"
                     title="Resume editing"
                   >
                     <i className="fas fa-pen-to-square text-xs" />
                   </button>
                   <button
                     onClick={() => handleDeleteGame(game.id)}
-                    className="text-[#707A8A] hover:text-[#FF3131] transition-colors px-2 py-1"
+                    className="text-[#707A8A] hover:text-[#FF8787] transition-colors px-2 py-1"
                     title="Delete game"
                   >
                     <i className="fas fa-trash text-xs" />
@@ -1664,9 +1850,9 @@ export default function App() {
                     key={i}
                     className={`text-sm px-2 py-1 rounded-lg ${
                       player.score > 0
-                        ? 'bg-[#3df2bc]/10 text-[#3df2bc]'
+                        ? 'bg-[#87DD87]/10 text-[#87DD87]'
                         : player.score < 0
-                          ? 'bg-[#FF3131]/10 text-[#FF3131]'
+                          ? 'bg-[#FF8787]/10 text-[#FF8787]'
                           : 'bg-[#2A2D33] text-[#E0E6ED]'
                     }`}
                   >
@@ -1679,12 +1865,67 @@ export default function App() {
                 ))}
               </div>
 
-              {specialPlayers.length > 0 && (
-                <div className="text-xs text-[#FFD700]">
-                  <i className="fas fa-star mr-1" />
-                  {specialPlayers.map((p) => `${p.name}: ${p.special}`).join(' | ')}
-                </div>
-              )}
+              {/* Per-player game summary */}
+              {game.rounds && game.rounds.length > 0 && (() => {
+                const seats = game.seats || [];
+                const rounds = game.rounds || [];
+                const playerSummary = game.players.map((player) => {
+                  const seatIdx = seats.indexOf(player.name);
+                  let wins = 0, chucks = 0, zimos = 0;
+                  const specialCounts: Record<string, number> = {};
+                  for (const r of rounds) {
+                    const winners = r.winnerSeats && r.winnerSeats.length > 1
+                      ? r.winnerSeats : (r.winnerSeat >= 0 ? [r.winnerSeat] : []);
+                    if (winners.includes(seatIdx)) {
+                      wins++;
+                      if (r.winType === 'zimo') zimos++;
+                      // Count specials for this winner
+                      if (r.winnerSeats && r.winnerSeats.length > 1 && r.specials) {
+                        const wIdx = r.winnerSeats.indexOf(seatIdx);
+                        if (wIdx >= 0 && r.specials[wIdx]) {
+                          const s = r.specials[wIdx];
+                          specialCounts[s] = (specialCounts[s] || 0) + 1;
+                        }
+                      } else if (r.winnerSeat === seatIdx && r.special) {
+                        specialCounts[r.special] = (specialCounts[r.special] || 0) + 1;
+                      }
+                    }
+                    if (r.winType === 'chutong' && r.loserSeat === seatIdx) chucks++;
+                    // Count 七搶一 specials
+                    if (r.sevenFlowers?.winnerSeat === seatIdx) {
+                      specialCounts['七搶一'] = (specialCounts['七搶一'] || 0) + 1;
+                    }
+                  }
+                  const detail = Object.entries(specialCounts).map(([k, v]) => `${k} x${v}`).join(', ') || '—';
+                  return { name: player.name, score: player.score, wins, chucks, zimos, detail };
+                });
+                return (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-[#2A2D33]">
+                          <th className="text-left py-1 pr-2 text-[#707A8A] font-medium">Player</th>
+                          <th className="text-right py-1 px-1 text-[#707A8A] font-medium">Win</th>
+                          <th className="text-right py-1 px-1 text-[#707A8A] font-medium">Chuck</th>
+                          <th className="text-right py-1 px-1 text-[#707A8A] font-medium">Tsumo</th>
+                          <th className="text-left py-1 pl-2 text-[#707A8A] font-medium">Detail</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {playerSummary.map((p, i) => (
+                          <tr key={i} className="border-b border-[#2A2D33]/50">
+                            <td className="py-1 pr-2 text-[#E0E6ED]">{p.name}</td>
+                            <td className="text-right py-1 px-1 text-[#E0E6ED]">{p.wins}</td>
+                            <td className="text-right py-1 px-1 text-[#E0E6ED]">{p.chucks}</td>
+                            <td className="text-right py-1 px-1 text-[#E0E6ED]">{p.zimos}</td>
+                            <td className="py-1 pl-2 text-[#E0E6ED]">{p.detail}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                );
+              })()}
             </Card>
           );
         })}
@@ -1720,7 +1961,7 @@ export default function App() {
                 onClick={() => setReviewYear(year)}
                 className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
                   year === selectedYear
-                    ? 'bg-[#3df2bc] text-[#0B0E14]'
+                    ? 'bg-[#87DD87] text-[#0B0E14]'
                     : 'bg-[#1A1D23] text-[#707A8A] border border-[#2A2D33] hover:text-[#E0E6ED]'
                 }`}
               >
@@ -1733,7 +1974,7 @@ export default function App() {
           const mostMoneyWinTop3 = pickTopPlayers(stats, {
             getValue: (s) => s.totalScore,
             requirePositive: false,
-            formatValue: (v) => String(v),
+            formatValue: (v) => `$${v}`,
           });
           const mostLossesTop3 = pickTopPlayers(stats, {
             getValue: (s) => s.losses,
@@ -1743,12 +1984,12 @@ export default function App() {
           const mostMoneyLoseTop3 = pickBottomPlayers(stats, {
             getValue: (s) => s.totalScore,
             requireNegative: true,
-            formatValue: (v) => String(v),
+            formatValue: (v) => `$${v}`,
           });
           const maxSingleHandTop3 = pickTopSpecialHands(stats);
-          const consecutiveDealerTop3 = pickTopConsecutiveDealer(
-            games.filter((g) => new Date(g.date).getFullYear() === year)
-          );
+          const yearGames = games.filter((g) => new Date(g.date).getFullYear() === year);
+          const consecutiveDealerTop3 = pickTopConsecutiveDealer(yearGames);
+          const zimoTop3 = pickTopZimoPlayers(yearGames);
           const totalGamesInYear = games.filter((g) => new Date(g.date).getFullYear() === year).length;
           const mostAttendanceTop3 = pickTopPlayers(stats, {
             getValue: (s) => s.gamesPlayed,
@@ -1829,6 +2070,12 @@ export default function App() {
                         <td className="py-1.5 sm:py-2">{consecutiveDealerTop3[2] || '—'}</td>
                       </tr>
                       <tr>
+                        <td className="py-1.5 sm:py-2 pr-2 whitespace-nowrap">自摸王</td>
+                        <td className="py-1.5 sm:py-2 pr-2">{zimoTop3[0] || '—'}</td>
+                        <td className="py-1.5 sm:py-2 pr-2">{zimoTop3[1] || '—'}</td>
+                        <td className="py-1.5 sm:py-2">{zimoTop3[2] || '—'}</td>
+                      </tr>
+                      <tr>
                         <td className="py-1.5 sm:py-2 pr-2 whitespace-nowrap">首席見證官</td>
                         <td className="py-1.5 sm:py-2 pr-2">{mostAttendanceTop3[0] || '—'}</td>
                         <td className="py-1.5 sm:py-2 pr-2">{mostAttendanceTop3[1] || '—'}</td>
@@ -1852,7 +2099,7 @@ export default function App() {
                         <th className="text-right py-1.5 sm:py-2 px-1 text-[#707A8A] font-medium">Games</th>
                         <th className="text-right py-1.5 sm:py-2 px-1 text-[#707A8A] font-medium">Total</th>
                         <th className="text-right py-1.5 sm:py-2 px-1 text-[#707A8A] font-medium">Wins</th>
-                        <th className="text-right py-1.5 sm:py-2 px-1 text-[#707A8A] font-medium">出統</th>
+                        <th className="text-right py-1.5 sm:py-2 px-1 text-[#707A8A] font-medium">Chuck</th>
                         <th className="text-right py-1.5 sm:py-2 px-1 text-[#707A8A] font-medium">Special</th>
                         <th className="text-left py-1.5 sm:py-2 pl-2 text-[#707A8A] font-medium">Detail</th>
                       </tr>
@@ -1867,7 +2114,7 @@ export default function App() {
                             <td
                               className={`py-1.5 sm:py-2 px-1 text-right font-semibold ${
                                 s.totalScore > 0
-                                  ? 'text-[#3df2bc]'
+                                  ? 'text-[#87DD87]'
                                   : s.totalScore < 0
                                     ? 'text-[#FF3131]'
                                     : ''
@@ -1891,8 +2138,8 @@ export default function App() {
 
               {/* AI Analysis Results */}
               {analysis && (
-                <Card className="border-[#3df2bc]/30">
-                  <h3 className="text-sm font-semibold text-[#3df2bc] mb-3">
+                <Card className="border-[#87DD87]/30">
+                  <h3 className="text-sm font-semibold text-[#87DD87] mb-3">
                     <i className="fas fa-wand-magic-sparkles mr-1" />
                     AI Analysis
                   </h3>
@@ -1906,7 +2153,7 @@ export default function App() {
                       </h4>
                       {analysis.playerInsights.map((pi, i) => (
                         <div key={i} className="bg-[#0B0E14] rounded-lg p-3">
-                          <span className="font-semibold text-[#3df2bc]">{pi.name}</span>
+                          <span className="font-semibold text-[#87DD87]">{pi.name}</span>
                           <span className="text-[#E0E6ED] ml-2">{pi.insight}</span>
                         </div>
                       ))}
