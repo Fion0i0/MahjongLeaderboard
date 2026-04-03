@@ -83,9 +83,10 @@ function pickTopSpecialHands(statsArray: PlayerYearlyStats[]): string[] {
       name: stats.name,
       hand: stats.maxSingleHand?.name || '',
       rank: stats.maxSingleHand?.rank || 0,
+      count: stats.specialCount,
     }))
     .filter((item) => item.hand && item.rank > 0)
-    .sort((a, b) => b.rank - a.rank || a.name.localeCompare(b.name));
+    .sort((a, b) => b.rank - a.rank || b.count - a.count || a.name.localeCompare(b.name));
 
   if (ranked.length === 0) return [];
   return ranked.slice(0, 3).map((item) => `${item.name} (${item.hand})`);
@@ -174,7 +175,7 @@ function computeYearlyData(games: Game[]): YearlyData[] {
       }
 
       const stats = playerStats.get(player.name)!;
-      const specialHands = parseSpecialHands(player.special);
+      const specialHands = parseSpecialHands(player.special).filter(h => h !== '七搶一');
 
       stats.totalScore += player.score;
       stats.gamesPlayed += 1;
@@ -199,6 +200,15 @@ function computeYearlyData(games: Game[]): YearlyData[] {
         const loserName = game.seats[round.loserSeat];
         if (loserName && playerStats.has(loserName)) {
           playerStats.get(loserName)!.losses += 1;
+        }
+      }
+      // Count 七搶一 as special from round data
+      if (round.sevenFlowers) {
+        const sfName = game.seats[round.sevenFlowers.winnerSeat];
+        if (sfName && playerStats.has(sfName)) {
+          const s = playerStats.get(sfName)!;
+          s.specialCount += 1;
+          s.specialBreakdown['七搶一'] = (s.specialBreakdown['七搶一'] || 0) + 1;
         }
       }
     }
@@ -273,6 +283,10 @@ function computeScoresFromRounds(seats: string[], rounds: Round[], baseRate: num
       });
     } else if (round.special) {
       specials[round.winnerSeat].push(round.special);
+    }
+    // 七搶一 counts as special for the winner
+    if (round.sevenFlowers) {
+      specials[round.sevenFlowers.winnerSeat].push('七搶一');
     }
 
     // Update dealer: stays if any winner is dealer, rotates otherwise
@@ -418,6 +432,7 @@ export default function App() {
   const [sevenFlowersLoser, setSevenFlowersLoser] = useState<number | null>(null);
   const [showRoundModal, setShowRoundModal] = useState(false);
   const [isMultiWinMode, setIsMultiWinMode] = useState(false);
+  const [swapSeat, setSwapSeat] = useState<number | null>(null);
 
   const resetRoundForm = () => {
     setRoundWinners([]);
@@ -662,9 +677,9 @@ export default function App() {
       return;
     }
     for (const seat of roundWinners) {
-      const fan = roundFans.get(seat) ?? 3;
-      if (fan <= 0) {
-        alert(`${gameSession!.seats[seat]} 台數 must be greater than 0.`);
+      const fan = roundFans.get(seat) ?? 0;
+      if (fan < 0) {
+        alert(`${gameSession!.seats[seat]} 台數 must be 0 or greater.`);
         return;
       }
     }
@@ -1050,6 +1065,21 @@ export default function App() {
             <div className="grid grid-cols-3 gap-1.5 sm:gap-2 max-w-[240px] sm:max-w-xs mx-auto place-items-center">
               {CROSS_GRID.map((seatIdx, cellIdx) => {
                 if (seatIdx === null) {
+                  if (cellIdx === 4) {
+                    return (
+                      <button key={cellIdx}
+                        onClick={() => setSwapSeat(swapSeat !== null ? null : -1)}
+                        className={`w-10 h-10 rounded-full flex items-center justify-center transition-all text-xs ${
+                          swapSeat !== null
+                            ? 'bg-[#FFD700] text-[#0B0E14]'
+                            : 'bg-[#2A2D33] text-[#707A8A] hover:text-[#FFD700]'
+                        }`}
+                        title="換位"
+                      >
+                        <i className="fas fa-repeat" />
+                      </button>
+                    );
+                  }
                   return <div key={cellIdx} />;
                 }
                 const name = gameSession.seats[seatIdx];
@@ -1058,17 +1088,34 @@ export default function App() {
                 return (
                   <div
                     key={cellIdx}
-                    className="flex flex-col items-center text-center cursor-pointer hover:opacity-80 transition-opacity"
+                    className={`flex flex-col items-center text-center cursor-pointer hover:opacity-80 transition-opacity ${swapSeat === seatIdx ? 'ring-2 ring-[#FFD700] rounded-xl' : ''}`}
                     onClick={() => {
+                      if (swapSeat !== null) {
+                        if (swapSeat === -1) {
+                          // First pick: select this player
+                          setSwapSeat(seatIdx);
+                          return;
+                        }
+                        // Second pick: swap with the first
+                        if (swapSeat !== seatIdx) {
+                          setGameSession(prev => {
+                            if (!prev) return prev;
+                            const newSeats = [...prev.seats];
+                            [newSeats[swapSeat], newSeats[seatIdx]] = [newSeats[seatIdx], newSeats[swapSeat]];
+                            return { ...prev, seats: newSeats };
+                          });
+                        }
+                        setSwapSeat(null);
+                        return;
+                      }
                       // Open round modal with this player as winner
                       setRoundWinners([seatIdx]);
-                      setRoundFans(new Map([[seatIdx, 3]]));
+                      setRoundFans(new Map([[seatIdx, 0]]));
                       setRoundSpecials(new Map([[seatIdx, '']]));
                       setFanCalcTexts(new Map([[seatIdx, '']]));
                       setActiveWinnerTab(seatIdx);
                       setRoundWinType('chutong');
                       setRoundLoser(null);
-                  
                       setRoundIsLeopard(false);
                       setIsMultiWinMode(false);
                       setShowRoundModal(true);
@@ -1116,15 +1163,16 @@ export default function App() {
           <div className="flex gap-2">
             <Button
               onClick={() => {
-                setRoundWinType('draw');
-                setRoundWinners([]);
-                setRoundLoser(null);
-                setRoundFans(new Map());
-                setRoundSpecials(new Map());
-                setFanCalcTexts(new Map());
-                setActiveWinnerTab(null);
-                setRoundIsLeopard(false);
-                addRound();
+                const drawRound: Round = {
+                  id: generateId(),
+                  winnerSeat: -1,
+                  winType: 'draw',
+                  fan: 0,
+                  special: '',
+                };
+                setGameSession((prev) =>
+                  prev ? { ...prev, rounds: [...prev.rounds, drawRound], dealerStreak: prev.dealerStreak + 1 } : prev
+                );
               }}
               variant="secondary"
               className="flex-1"
@@ -1150,7 +1198,12 @@ export default function App() {
               自摸
             </Button>
           </div>
-          <p className="text-center text-xs text-[#707A8A] mt-1">點擊玩家頭像 = 出統食胡</p>
+          <p className="text-center text-xs mt-1">
+            {swapSeat !== null
+              ? <span className="text-[#FFD700]">請點擊玩家交換位置</span>
+              : <span className="text-[#707A8A]">點擊玩家頭像 = 出統食胡</span>
+            }
+          </p>
 
           {/* ─── Round Modal Popup ─── */}
           {showRoundModal && gameSession && (() => {
@@ -1203,7 +1256,7 @@ export default function App() {
                           <button key={i} type="button"
                             onClick={() => {
                               setRoundWinners([i]);
-                              setRoundFans(new Map([[i, 3]]));
+                              setRoundFans(new Map([[i, 0]]));
                               setRoundSpecials(new Map([[i, '']]));
                               setFanCalcTexts(new Map([[i, '']]));
                               setActiveWinnerTab(i);
@@ -1231,25 +1284,27 @@ export default function App() {
                             {gameSession.seats[seat]} ({roundFans.get(seat) ?? 3}台)
                           </button>
                         ))}
-                        {roundWinners.length < 3 && (
-                          <button type="button"
-                            onClick={() => {
-                              // Pick next available non-winner
-                              const available = [0,1,2,3].filter(i => !roundWinners.includes(i) && i !== roundLoser);
-                              if (available.length > 0) {
-                                const next = available[0];
-                                setRoundWinners(prev => [...prev, next]);
-                                setRoundFans(m => new Map(m).set(next, 3));
-                                setRoundSpecials(m => new Map(m).set(next, ''));
-                                setFanCalcTexts(m => new Map(m).set(next, ''));
-                                setActiveWinnerTab(next);
-                              }
-                            }}
-                            className="px-2 py-1.5 rounded-lg text-xs font-medium bg-[#0B0E14] text-[#3df2bc] border border-[#3df2bc]/30 hover:border-[#3df2bc]"
-                          >
-                            <i className="fas fa-plus" />
-                          </button>
-                        )}
+                        {roundWinners.length < 3 && (() => {
+                          const available = [0,1,2,3].filter(i => !roundWinners.includes(i) && i !== roundLoser);
+                          return available.length > 0 && (
+                            <div className="flex gap-1">
+                              {available.map(si => (
+                                <button key={si} type="button"
+                                  onClick={() => {
+                                    setRoundWinners(prev => [...prev, si]);
+                                    setRoundFans(m => new Map(m).set(si, 0));
+                                    setRoundSpecials(m => new Map(m).set(si, ''));
+                                    setFanCalcTexts(m => new Map(m).set(si, ''));
+                                    setActiveWinnerTab(si);
+                                  }}
+                                  className="px-2 py-1.5 rounded-lg text-xs font-medium bg-[#0B0E14] text-[#707A8A] border border-[#2A2D33] hover:border-[#3df2bc] hover:text-[#3df2bc]"
+                                >
+                                  + {gameSession.seats[si]}
+                                </button>
+                              ))}
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
                   )}
@@ -1299,7 +1354,7 @@ export default function App() {
                             {isMultiWinMode ? `${gameSession.seats[activeWinnerTab]} 台數` : '台數'}
                           </label>
                           <div className="h-[180px] overflow-y-auto rounded-lg border border-[#2A2D33] bg-[#0B0E14] scroll-smooth snap-y snap-mandatory">
-                            {Array.from({ length: 13 }, (_, i) => i + 1).map(n => (
+                            {Array.from({ length: 14 }, (_, i) => i).map(n => (
                               <button key={n} type="button"
                                 onClick={() => setRoundFans(m => new Map(m).set(activeWinnerTab!, n))}
                                 className={`w-full py-2.5 text-center text-sm font-medium snap-center transition-all ${
