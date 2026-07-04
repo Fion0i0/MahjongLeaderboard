@@ -261,12 +261,12 @@ function computeScoresFromRounds(seats: string[], rounds: Round[], baseRate: num
       }
     } else if (round.loserSeat !== undefined) {
       // Dealer extra when dealer is winner OR loser (出統)
-      const dealerInvolved = round.loserSeat === dealerSeat || winners.includes(dealerSeat);
-      const chutongDealerExtra = dealerInvolved ? dealerExtra : 0;
+      const chutongDealerExtra = (round.loserSeat === dealerSeat || winners.includes(dealerSeat)) ? dealerExtra : 0;
       if (winners.length > 1 && round.fans) {
-        // 一炮雙響 / 一炮三響: loser pays each winner
+        // 一炮雙響 / 一炮三響: loser pays each winner; dealer extra only for the dealer's transaction
         for (let w = 0; w < winners.length; w++) {
-          const winnerAmount = (di + round.fans[w] * baseRate) * leopardMul + chutongDealerExtra;
+          const thisExtra = (winners[w] === dealerSeat || round.loserSeat === dealerSeat) ? dealerExtra : 0;
+          const winnerAmount = (di + round.fans[w] * baseRate) * leopardMul + thisExtra;
           scores[winners[w]] += winnerAmount;
           scores[round.loserSeat] -= winnerAmount;
         }
@@ -543,15 +543,16 @@ export default function App() {
         }
       } else if (round.loserSeat !== undefined) {
         const dealerExtra = (2 * dk + 1) * baseRate * lm;
-        const ctDealerExtra = (round.loserSeat === ds || winners.includes(ds)) ? dealerExtra : 0;
         if (winners.length > 1 && round.fans) {
           for (let w = 0; w < winners.length; w++) {
-            const winnerAmount = (di + round.fans[w] * baseRate) * lm + ctDealerExtra;
+            const thisExtra = (winners[w] === ds || round.loserSeat === ds) ? dealerExtra : 0;
+            const winnerAmount = (di + round.fans[w] * baseRate) * lm + thisExtra;
             t[winners[w]] += winnerAmount;
             t[round.loserSeat] -= winnerAmount;
           }
         } else {
           const amount = (di + round.fan * baseRate) * lm;
+          const ctDealerExtra = (round.loserSeat === ds || round.winnerSeat === ds) ? dealerExtra : 0;
           t[round.winnerSeat] += amount + ctDealerExtra;
           t[round.loserSeat] -= (amount + ctDealerExtra);
         }
