@@ -209,6 +209,10 @@ function computeYearlyData(games: Game[]): YearlyData[] {
           const s = playerStats.get(sfName)!;
           s.specialCount += 1;
           s.specialBreakdown['七搶一'] = (s.specialBreakdown['七搶一'] || 0) + 1;
+          const sfRank = getSpecialHandRank('七搶一');
+          if (sfRank > s.maxSingleHand.rank) {
+            s.maxSingleHand = { name: '七搶一', rank: sfRank };
+          }
         }
       }
     }

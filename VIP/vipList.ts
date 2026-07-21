@@ -11,6 +11,8 @@ export const DEFAULT_VIP_LIST: VIPMember[] = [
   { name: 'Jake', image: '/VIP/Jake.png' },
   { name: 'Long²', image: '/VIP/Long².png' },
   { name: 'Kaka', image: '/VIP/Kaka.png' },
+  { name: 'Ke', image: '/VIP/Ke.png' },
+  { name: 'Step', image: '/VIP/Step.png' },
 ];
 
 export const VIP_STORAGE_KEY = 'mahjong-vip-list';
